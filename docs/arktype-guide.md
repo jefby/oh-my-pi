@@ -1,6 +1,6 @@
 # ArkType Guide (for migrating Zod → ArkType in this repo)
 
-Pinned to **arktype 2.2.0** (installed). Verified against the installed `.d.ts` and runtime this
+Pinned to **arktype 2.2.3** (installed). Verified against the installed `.d.ts` and runtime this
 session. Author types with `import { type } from "arktype"`.
 
 > **Scope rule (READ FIRST).** Zod stays supported at the **external boundary** — `Tool.parameters`
