@@ -1,7 +1,7 @@
 # Oh My Pi (OMP) — 软件架构分析
 
-> 项目版本: 17.1.8  
-> 分析日期: 2025-03-27  
+> 项目版本: 17.2.4  
+> 分析日期: 2026-08-02  
 > 主要入口: `packages/coding-agent/src/cli.ts` → `omp` CLI
 
 ---
@@ -79,10 +79,11 @@ User Input (CLI/TUI)
 
 ```text
 crates/
-├── pi-natives/      ← 主要 N-API 绑定 (grep, fd, 剪贴板, 高亮, sixel, shell, AST)
+├── pi-natives/      ← 主要 N-API 绑定 (grep, fd, 剪贴板, 高亮, sixel, shell, AST, 媒体)
+├── pi-voice/        ← 音频采集/播放与 WebRTC 实时对话 (从 pi-natives 拆分出的独立 crate)
 ├── pi-ast/          ← AST / tree-sitter 代码摘要与结构化查询
 ├── pi-iso/          ← 文件系统隔离/操作 (APFS clone, reflink, overlayfs, projfs)
-├── pi-shell/        ← 嵌入式 shell / PTY / 进程管理 (wraps brush-*)
+├── pi-shell/        ← 嵌入式 shell / PTY / 进程管理 / 进程管理内置命令 / 跨平台快照 (wraps brush-*)
 ├── pi-uu-diff/      ← diff 实现
 ├── pi-uu-grep/      ← grep 实现
 ├── pi-uutils-ctx/   ← uutils 上下文
@@ -108,8 +109,8 @@ cli.ts (#!/usr/bin/env bun)
   │   └─ Yes → runCli(process.argv.slice(2))
   │
   ├─ runWorkerEntrypoint(workerArg)
-  │   ├─ 工作线程调度 (__omp_worker_tiny_inference, stats_sync, tab, 
-  │   │  computer, js_eval, js_eval_process, stt, tts, mnemopi_embed, daemon_broker)
+  │   ├─ 工作线程调度 (__omp_worker_tiny_inference, stats_sync, tab, computer,
+  │   │  js_eval, js_eval_process, stt, tts, mnemopi_embed, terminal_output, daemon_broker)
   │   └─ 通过 argv selector 复用同一入口模块
   │
   ├─ --smoke-test → runSmokeTest()  (所有 worker 的启动验证)
@@ -127,14 +128,15 @@ cli.ts (#!/usr/bin/env bun)
 ```typescript
 // 所有顶层命令
 commands: [
-  launch, acp, auth-broker, auth-gateway, agents, bench, commit,
+  launch, acp, auth-broker, auth-gateway, agents, bench, cleanse, commit,
   completions, __complete, config, dry-balance, gc, grep, gallery,
   grievances, install, join, models, plugin, say, setup, shell,
-  read, ssh, stats, update, usage, tiny-models, token, ttsr, 
-  worktree, search
+  read, ssh, stats, update, usage, tiny-models, token, ttsr,
+  worktree (alias wt), search (alias q)
 ]
 // 保留词防止泄露给 LLM: extensions, list, remove, uninstall, marketplace,
 // discover, upgrade, enable, disable
+// cleanse — 用加权并行的文件不相交子代理检测并修复项目诊断
 ```
 
 ### 3.3 主启动时序 (`main.ts`)
@@ -280,10 +282,11 @@ interface AgentTool {
 | **代码分析** | `grep`, `ast_grep`, `ast_edit`, `lsp`, `debug` | 按 settings 开关 (默认大部分启用) |
 | **知识/技能** | `learn`, `manage_skill` | 需 autolearn.enabled && taskDepth===0 |
 | **记忆** | `memory_edit`, `retain`, `recall`, `reflect` | 按 memory.backend (hindsight/mnemopi 开启后者) |
-| **Web** | `browser`, `web_search`, `fetch` | 按 settings 开关 (默认仅 web_search 启用) |
+| **Web** | `browser`, `web_search`, `fetch` | 按 settings 开关 (browser/web_search 默认启用) |
 | **GitHub** | `github` | 按 github.enabled |
 | **图像/语音** | `inspect_image`, `generate_image`, `tts` | 按 settings 开关 / 图像模式 |
-| **其他** | `checkpoint`, `rewind`, `resolve`, `review`, `vibe`, `todo`, `ask`, `yield` (hidden), `goal` (hidden) | 按 settings 开关 / Goal 模式激活 |
+| **安全** | `security_scan`, `security_publish` | 按 `security.enabled` 开关 |
+| **其他** | `checkpoint`, `rewind`, `resolve`, `review`, `vibe`, `todo`, `ask`, `yield` (hidden), `goal` (hidden) | 按 settings 开关 (ask 默认启用) / Goal 模式激活 |
 
 ### 5.3 工具集注册
 
@@ -297,6 +300,8 @@ interface AgentTool {
 6. 自定义工具 (extensibility/custom-tools) — 用户自定义
 7. 技能绑定工具 (extensibility/skills) — 技能触发的工具
 8. xdev 挂载 (tools/xdev.ts) — discoverable 工具转为 xd:// 虚拟设备
+9. 共享浏览器守护进程 (`tools/browser/shared-daemon.ts`) — broker 监管的 Chromium，会话通过 CDP 打开标签页
+10. 安全扫描工具 (`tools/security-scan.ts` + `security/`) — `security.enabled` 开启后注册
 ```
 
 每个工具使用 Handlebars 模板化的 `prompts/tools/*.md` 文件作为描述，渲染器使用 TUI 组件进行输出显示。
@@ -334,6 +339,9 @@ providers/
 ├── openai-chat-server-schema.ts   服务端 schema
 ├── openai-chat-wire.ts            线协议格式化
 ├── openai-codex-responses.ts      OpenAI Codex API
+├── openai-codex/                 Codex 平台共享模块
+├── openai-completions.ts         OpenAI Completions (旧版)
+├── openai-shared.ts              OpenAI 共享类型
 ├── openai-anthropic-shim.ts       Anthropic ↔ OpenAI 适配
 ├── openai-reasoning-fallback.ts   推理回退
 ├── azure-openai-responses.ts      Azure OpenAI
@@ -344,14 +352,18 @@ providers/
 ├── google-shared.ts               Google 共享类型
 ├── google-types.ts                Google 类型
 ├── amazon-bedrock.ts              Amazon Bedrock
+├── aws-credentials.ts · aws-sigv4.ts · aws-eventstream.ts   AWS 凭证/签名/流式
+├── error-message.ts               错误消息格式化
 ├── ollama.ts                      本地 Ollama
-├── cursor.ts / cursor/            Cursor IDE 集成
+├── cursor.ts / cursor/            Cursor IDE 集成（现代化 exec 桥接 + protobuf 协议）
 ├── devin.ts / devin/              Devin AI
 ├── kimi.ts                        Moonshot Kimi
 ├── gitlab-duo.ts                  GitLab Duo
 ├── gitlab-duo-workflow.ts         GitLab Duo Workflow
 ├── claude-code-fingerprint.ts     Claude Code 指纹
 ├── github-copilot-headers.ts      GitHub Copilot 头
+├── cowork-fetch.ts                自定义 HTTPS/TLS/代理 fetch 层（Cursor/cowork 路径）
+├── cursor-pi-args.ts              Cursor 旧版 Pi shim 与现代帧参数翻译
 ├── pi-native-client.ts            Native Pi 客户端
 ├── pi-native-server.ts            Native Pi 服务端
 ├── mock.ts                        测试 Mock
@@ -364,7 +376,40 @@ providers/
 
 供应商通过 `packages/catalog/src/provider-models/` 中的描述符和解析器注册到模型目录。
 
-### 6.2 模型目录 (`packages/catalog/`)
+### 6.2 Provider Registry (`packages/ai/src/registry/`)
+
+除 `providers/` 中的协议实现外，OMP 在 `packages/ai/src/registry/` 维护可插拔的供应商注册表，负责 API 密钥验证、默认端点、账单/用量适配：
+
+```
+registry/
+├── registry.ts            统一注册入口 / 类型
+├── api-key-login.ts       API-key 登录向导
+├── api-key-validation.ts  共享密钥验证逻辑
+├── anthropic.ts · openai.ts · google.ts · azure.ts · amazon-bedrock.ts   第一方协议供应商
+├── openai-codex.ts · openai-codex-device.ts       Codex 平台（含设备绑定）
+├── google-vertex.ts · google-gemini-cli.ts · google-antigravity.ts
+├── github-copilot.ts · gitlab-duo.ts · gitlab-duo-workflow.ts
+├── cursor.ts · devin.ts · opencode-go.ts · opencode-zen.ts · meta.ts
+├── xai.ts · xai-oauth.ts · zai.ts · kimi-code.ts · moonshot.ts
+├── openrouter.ts · deepseek.ts · groq.ts · fireworks.ts · together.ts
+├── cerebras.ts · mistral.ts · nvidia.ts · baseten.ts · coreweave.ts
+├── vllm.ts · lm-studio.ts · llama-cpp.ts · ollama.ts · ollama-cloud.ts
+├── parallel.ts · novita.ts · aiand.ts · gmi-cloud.ts · umans.ts · venice.ts
+├── wafer-serverless.ts · aimlapi.ts · nanogpt.ts · sakana.ts · kilo.ts · zenmux.ts
+├── siliconflow.ts · siliconflow-cn.ts · qianfan.ts · qwen-portal.ts
+├── minimax.ts · minimax-code.ts · minimax-code-cn.ts
+├── zhipu-coding-plan.ts · alibaba-coding-plan.ts · alibaba-token-plan.ts
+├── xiaomi.ts · xiaomi-token-plan-cn.ts · xiaomi-token-plan-ams.ts · xiaomi-token-plan-sgp.ts
+├── exa.ts · tavily.ts · kagi.ts · perplexity.ts   搜索/检索 API
+├── cloudflare-ai-gateway.ts · vercel-ai-gateway.ts · litellm.ts · huggingface.ts
+├── firepass.ts · derived.ts · synthetic.ts
+├── oauth/                  OAuth 供应商注册
+└── ...
+```
+
+自 v17.x 起 `registry/` 从零散的 5 个条目（`aiand`、`exa`、`gmi-cloud`、`novita`、`xai`）扩展为覆盖 70+ 供应商的完整注册表：第一方/OAuth 协议供应商、API-key OpenAI-compatible 宿主、区域 token 计划（阿里/小米/智谱）、搜索 API 与 AI 网关均以插件式条目注册，`registerProvider()` 统一负责密钥验证、默认端点与账单/用量适配，新增供应商无需改动 `providers/` 协议实现。
+
+### 6.3 模型目录 (`packages/catalog/`)
 
 ```
 catalog/
@@ -388,7 +433,7 @@ catalog/
 │   └── wire/              线协议格式化
 ```
 
-### 6.3 认证 & 密钥管理
+### 6.4 认证 & 密钥管理
 
 ```
 api-key-resolver.ts     ← API 密钥解析
@@ -444,6 +489,7 @@ internal-urls/
 ├── mcp-protocol.ts          mcp:// MCP 资源
 ├── omp-protocol.ts          omp:// OMP 内部
 ├── rule-protocol.ts         rule:// 规则
+├── security-protocol.ts     security:// 安全扫描资源 (只读)
 ├── skill-protocol.ts        skill:// 技能
 ├── ssh-protocol.ts          ssh:// 远程文件
 ├── vault-protocol.ts        vault:// 密钥库
@@ -974,12 +1020,13 @@ CLI 入口 (`cli.ts`) 作为中央 dispatcher。Worker 进程/线程通过 **隐
 │   ├── __omp_worker_tiny_inference       → tiny/worker.ts (子进程)
 │   ├── __omp_worker_stats_sync           → omp-stats/sync-worker (worker_thread)
 │   ├── __omp_worker_tab                  → tools/browser/tab-worker-entry (worker_thread)
-│   ├── __omp_worker_computer             → tools/computer/worker-entry (worker_thread)
+│   ├── __omp_worker_computer             → tools/computer/worker-entry (worker_thread, 桌面捕获/CUA)
 │   ├── __omp_worker_js_eval              → eval/js/worker-entry (worker_thread)
 │   ├── __omp_worker_js_eval_process      → eval/js/process-entry (子进程)
 │   ├── __omp_worker_stt                  → stt/asr-worker (子进程)
 │   ├── __omp_worker_tts                  → tts/tts-worker (子进程)
 │   ├── __omp_worker_mnemopi_embed        → mnemopi/embed-worker (子进程)
+│   ├── __omp_worker_terminal_output      → launch/terminal-output-worker (worker_thread)
 │   └── __omp_worker_daemon_broker        → launch/broker (worker_thread)
 └── 主交互循环 (InteractiveMode)
 ```
@@ -1021,19 +1068,19 @@ Session Storage 层次:
 | `disabledProviders` | 禁用的供应商 | [] |
 | `modelRoles` | 模型角色映射 | {} |
 | `modelProviderOrder` | 供应商优先级排序 | [] |
-| `defaultThinkingLevel` | 默认思考级别 | "normal" |
+| `defaultThinkingLevel` | 默认思考级别 | "high" |
 | `prewalk.enabled` | 首次编辑后切换快速模型 | false |
-| `tools.approvalMode` | 工具审批模式 | "off" |
-| `tools.xdev` | 启用 xd:// 虚拟设备挂载 | false |
+| `tools.approvalMode` | 工具审批模式 | "yolo" |
+| `tools.xdev` | 启用 xd:// 虚拟设备挂载 | true |
 | `autoResume` | 自动恢复上次会话 | false |
 | `advisor.enabled` | 顾问子系统开关 | false |
-| `memory.backend` | 记忆后端 | null |
+| `memory.backend` | 记忆后端 | "off" |
 | `memories.enabled` | 记忆系统启用 | false |
 | `bash.autoBackground.enabled` | 自动后台 bash | false |
 | `startup.checkUpdate` | 启动时检查更新 | true |
 | `startup.setupWizard` | 启动引导向导 | true |
-| `theme.preset` | 主题预设 | "titanium" |
-| `theme.mode` | 主题模式 (light/dark) | "light" |
+| `theme.dark` | 深色主题预设 | "titanium" |
+| `theme.light` | 浅色主题预设 | "light" |
 | `symbolPreset` | 符号预设 | "unicode" |
 | `colorBlindMode` | 色盲模式 | false |
 | `telemetry.otlp.enabled` | OTLP 遥测导出 | false |
@@ -1041,20 +1088,24 @@ Session Storage 层次:
 | `task.isolation.mode` | 子代理隔离模式 | 依设置 |
 | `autoresearch.enabled` | 自动研究 | false |
 | `lsp.enabled` | LSP 集成 | true |
-| `debug.enabled` | DAP 调试器 | false |
-| `goal.enabled` | Goal 模式 | false |
+| `debug.enabled` | DAP 调试器 | true |
+| `goal.enabled` | Goal 模式 | true |
 | `bash.enabled` | Bash Shell | true |
 | `glob.enabled` | Glob 搜索 | true |
 | `grep.enabled` | Grep 搜索 | true |
 | `web_search.enabled` | Web 搜索 | true |
-| `browser.enabled` | 浏览器 | false |
+| `browser.enabled` | 浏览器 | true |
+| `ask.enabled` | Ask 交互式提问 | true |
 | `computer.enabled` | 计算机使用 (CUA) | false |
-| `astGrep.enabled` | AST 搜索 | true |
+| `astGrep.enabled` | AST 搜索 | false |
 | `astEdit.enabled` | AST 编辑 | true |
-| `checkpoint.enabled` | 检查点/回退 | true |
-| `autolearn.enabled` | 自动学习 | true |
-| `tiny.device` | Tiny 模型设备 | (自动探测) |
-| `tiny.dtype` | Tiny 模型精度 | (自动探测) |
+| `checkpoint.enabled` | 检查点/回退 | false |
+| `autolearn.enabled` | 自动学习 | false |
+| `providers.tinyModel` | 会话标题模型 (online/local) | online (@smol) |
+| `providers.tinyModelDevice` | Tiny 模型 ONNX 设备 (CPU/GPU) | cpu |
+| `providers.tinyModelDtype` | Tiny 模型量化精度 | q4 (模型自带) |
+| `eval.py` / `eval.js` | Python/JS eval 后端 | true |
+| `ttsr.enabled` | TTSR (文本到语音渲染) 工具 | true |
 
 ---
 
@@ -1094,3 +1145,384 @@ bun run release   # 发布流程 (版本更新 + CHANGELOG + publish)
 10. **内部 URL 统一协议**: agent://、pr://、issue://、skill://、memory://、xd://、mcp://、docs://、omp://、local:// 等让文件型工具无感访问异构资源
 11. **服务端/线协议分离**: Anthropic Messages、OpenAI Responses/Chat 均有独立 server/wire 层，支持 ACP/RPC/server 部署形态
 12. **单一入口 Worker 复用**: 所有 worker 复用 cli.ts 入口，隐藏 argv selector 分发；Tiny/STT/TTS/Mnemopi 推理运行在 IPC 子进程中，父进程 SIGKILL 子进程以规避 NAPI 终结器崩溃 (issue #1606)
+
+
+---
+
+## 31. Codex Security Scan Architecture (v17+ New Feature)
+
+### 31.A Overview
+
+OMP v17 introduces a comprehensive security scanning system that provides both OMP-native repository analysis and optional integration with Codex Cloud for enterprise-grade security reviews. The system is designed around immutability, auditability, and separation of concerns between native and cloud-based operations.
+
+**Key Capabilities**:
+- ✅ Immutable scan plans pinned to specific repository snapshots
+- ✅ Multi-target support (repository-wide, scoped paths, working tree, ref diffs)  
+- ✅ Native OMP worker-based review with evidence chain validation
+- ✅ Codex Cloud integration for large-scale enterprise scanning
+- ✅ SARIF-compliant output for CI/CD tooling
+
+### 31.B Core Components
+
+#### SecurityCoordinator
+
+The central orchestrator managing all security scan operations:
+
+```typescript
+class SecurityCoordinator {
+    #operations: Map<string, SecurityOperationRecord>;
+    
+    async preflight(input): Promise<SecurityScanPlan>
+        // Creates immutable plan bound to repo snapshot + model + OAuth
+    
+    async start(planId): Promise<Snapshot>  
+        // Launches scan as background job with progress tracking
+        
+    async status(operationId), cancel(operationId), wait(operationId)
+}
+
+interface SecurityOperationRecord {
+    snapshot: SecurityOperationSnapshot;
+    promise: Promise<void>;           // Async operation or completed result
+    abortController?: AbortController; // For direct process control
+    jobId?: string;                   // If using asyncJobManager
+}
+```
+
+**Recovery Mechanism**: Automatically detects and recovers from interrupted operations by scanning the store for incomplete bundles.
+
+#### SecurityStore (SQLite-backed)
+
+Persistent storage organized around SARIF bundle structure:
+
+| Table | Purpose | Key Fields |
+|-------|---------|------------|
+| `security_scans` | Scan metadata | id, project_key, status, plan_id FK |  
+| `security_plans` | Immutable plans | id (fingerprint), target_kind, workflow_fingerprint UNIQUE |
+| `security_findings` | Individual findings | scan_id FK, finding_index, evidence_ids[] |
+
+**Bundle Structure**: Each bundle contains:
+```typescript
+interface SecurityScanBundle {
+    scan: {
+        documentType: "omp-security.scan";
+        schemaVersion: "1.0";
+        id: string;                    // UUIDv7-based  
+        projectKey: string;            // Repository identifier
+        status: 'running'|'completed'|'failed';
+        plan: SecurityScanPlan;
+        target: SecurityTargetRequest;
+        findings: Finding[];           // SARIF format with OMP IDs
+        coverage: CoverageInfo;        // What was scanned
+    };
+    findings: Finding[];               // Flattened for easy access  
+}
+```
+
+#### CodexCloudClient (Optional Cloud Integration)
+
+Separate client for managing cloud-based security scans:
+
+| Action | Purpose | Parameters |
+|--------|---------|------------|
+| `listAllConfigurations` | List available scan configs | credential_id? (pin specific account) |  
+| `startScan` | Start new cloud analysis | repository_url, environment_id，lookback_days |  
+| `getStats` | Get progress metrics | configuration_id |  
+| `pullResults` | Import findings locally | configuration_id, output_path |
+
+**Important**: Cloud actions consume separate quota and are never fallbacks from native scans.
+
+### 31.C Target Types & Coverage Strategies
+
+The system supports four target kinds with different coverage modes:
+
+```typescript
+enum SecurityTargetKind {
+    'repository',      // Full repo scan - repository mode
+    'scoped_path',     // Specific paths only - scoped_paths mode  
+    'working_tree',    // Uncommitted changes - working_tree mode
+    'ref_diff'         // Commit diff comparison - diff mode
+}
+
+interface SecurityTargetRequest {
+    kind: SecurityTargetKind;
+    includePaths?: string[];   // Paths to scan (scoped_path)
+    excludePaths?: string[];   // Glob patterns to skip
+    baseRevision?: string;     // For ref_diff only  
+    headRevision?: string;     // Required for ref_diff
+}
+```
+
+**Coverage Modes**:
+| Target | Coverage Mode | Description |
+|--------|---------------|-------------|
+| repository | `repository` | Entire codebase with full inventory strategy |  
+| scoped_path | `scoped_paths` | Only specified paths, no auto-discovery |  
+| working_tree | `working_tree` | Staged/unstaged changes only |  
+| ref_diff | `diff` | Changes between two commits |
+
+### 31.D Security Evidence Chain Model
+
+Each finding requires an evidence chain for auditability:
+
+```typescript
+interface SecurityEvidence {
+    id: string;        // Unique identifier (fingerprint + label + index)
+    kind: 'validation' | 'other' as const;
+    label: string;     // Human-readable, e.g., "line-42" or "function-auth-check"  
+    explanation: string; // Why this evidence supports the finding
+}
+
+type ValidationStatus = 
+    | 'unvalidated';   // Default - awaiting review
+    | 'validated';     // Evidence accepted as valid proof
+    | 'rejected';      // False positive / wrong context
+    | 'partial';       // Some evidence items valid  
+    | 'error';         // Invalid format or missing required fields
+
+interface SecurityFinding {
+    id: string;                    // scan_id + file_path + line_number
+    validationStatus: ValidationStatus;
+    summary: string;               // High-level explanation
+    
+    evidence: SecurityEvidence[];  // Proof chain for this finding
+}
+```
+
+**Validation Workflow**:
+1. Scan identifies potential issue → creates unvalidated finding  
+2. User/tool reviews and provides evidence (via `security_scan validate` action)  
+3. Evidence is chained to finding with unique ID generation  
+4. Finding status updated based on validation outcome  
+
+### 31.E Security Publication Tool
+
+Dedicated tool for canonicalizing scan results:
+
+```typescript
+interface SecurityPublicationToolParams {
+    // Must be called exactly ONCE per in-scope disposition
+    action: 'publish';  
+    
+    // Evidence must be grounded ONLY in files inspected during this specific scan  
+    findings: Finding[];
+    
+    // Cannot invent IDs - all evidence IDs must match store schema  
+}
+
+// Constraints enforced by tool implementation:
+// ❌ CANNOT create new finding IDs arbitrarily  
+// ✅ MUST use existing OMP-owned ID scheme (createSecurityEvidenceId)  
+// ❌ CANNOT edit security store directly via file I/O  
+```
+
+### 31.F Operational Workflow Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as User/Agent
+    participant S as SecurityCoordinator
+    participant M as Model API
+    participant J as Job Manager (optional)
+    participant W as OMP Worker Session
+    participant C as Codex Cloud
+    
+    Note over U,S: Phase 1: Planning
+    
+    U->>S: security_scan preflight(target, options?)
+    
+    alt refdiff target requires revisions  
+        S->>U: Request base_revision + head_revision
+    end
+    
+    U-->>S: Provide required parameters
+    
+    S->>M: Call model for plan generation (immutable)
+    M-->>S: Return fingerprint-based plan
+    
+    S->>Store: Save plan bundle with workflow_fingerprint
+    Note over Store: Plan pinned to snapshot + credential
+    
+    Note over U,S: Phase 2: Execution
+    
+    U->>S: security_scan start(plan_id, optional operation_id)
+    
+    alt AsyncJobManager available  
+        S->>J: Register task with progress callback
+        J-->>U: Stream progress updates
+    else No job manager
+        S-->>U: Return AbortController for manual control
+    end
+    
+    U->>W: Prompt security review request (Handlebars template)
+    
+    Note over W,S: Phase 3: Review Loop
+    
+    loop For each in-scope file
+        W->>Read: Read and inspect files  
+        alt Cloud integration needed?
+            W->>C: CLOUD_PULL to import cloud findings
+            C-->>W: Return SARIF results
+        end
+        
+        W->>Analysis: Analyze code patterns, generate findings
+    end
+    
+    W->>PublicationTool: Publish final results with evidence chain
+    PublicationTool->>S: onPublished callback fires
+    S->>Store: Write canonical bundle + update status to "completed"
+    
+    Note over U,S: Phase 4: Validation (optional)
+    
+    loop For each finding needing review  
+        U->>PublicationTool: validate(finding_id, new_status, evidence[])
+        
+        alt validated/rejected/partial/error  
+            PublicationTool->>Store: Update validation state with evidence IDs
+        end
+    end
+    
+    Note over S: Bundle published - scan complete
+```
+
+### 31.G State Machine Transitions
+
+| From | To | Trigger Event | Notes |
+|------|----|---------------|-------|
+| `queued` → `preparing` | Directory created, target prepared before review starts | Output dir ready |  
+| `preparing` → `reviewing` | Session prompt sent to worker | Review loop begins |  
+| `reviewing` → `publishing` | First publication tool call | Findings being written |  
+| `publishing` → `completed` | Bundle successfully persisted | All files processed |  
+| `reviewing/publishing` → `partial` | Session ends without publish | Error or timeout during session |  
+| Any running state → `cancelled` | AbortSignal fired OR user calls cancel() | Graceful shutdown |  
+| Any state → `failed` | Uncaught exception, unrecoverable error | Terminal failure |  
+
+### 31.H Coordinator Recovery Guarantees
+
+The coordinator implements automatic recovery for process crashes:
+
+```typescript
+async #recoverInterruptedOperations(): Promise<void> {
+    const store = await openStore(host.cwd);
+    
+    // Scan all bundles for incomplete operations  
+    for (const bundle of listScans(store)) {
+        if (!isTerminal(bundle.scan.status) && !alreadyHandled(bundle.id)) {
+            // Mark as failed with recovery message
+            bundle.scan.error = "Security scan interrupted by process restart";
+            
+            // Clean up temporary worktrees (ref_diff mode only)  
+            void cleanupWorktreeTarget(bundle).catch(() => {});
+        }
+    }
+}
+```
+
+**Recovery Properties**:
+- ✅ Detects incomplete scans after crash/restart  
+- ✅ Preserves published findings if bundle already written  
+- ✅ Cleans up orphaned worktrees to prevent disk space issues  
+- ✅ Marks terminal states appropriately for resume decisions  
+
+### 31.I Cloud Integration Architecture
+
+Cloud scanning is a separate workflow, never used as fallback from native:
+
+```mermaid
+graph TD
+    A[User selects cloud_scan action] --> B[List available configurations)
+    
+    B --> C{Choose configuration}
+    C -.→ B
+    
+    C --> D[CLOUD_START with repo_url + environment_id]
+    
+    D --> E[Poll progress via CLOUD_STATUS API]
+    E --> F{Scan complete?}
+    
+    alt Not ready yet  
+        F --> E
+    else Ready  
+        F --> G[List findings from cloud)
+        
+        G --> H[CLOUD_PULL to import locally]
+        
+        H --> I[Merge with native scan results if applicable]
+        
+        I --> J[Publish combined bundle]
+    end
+    
+    Note over D,H: Cloud actions consume<br/>separate quota allowance
+```
+
+**Cloud Action Parameters**:
+| Parameter | Required For | Description |  
+|-----------|--------------|-------------|
+| `repository_id` | cloud_start,cloud_status | Internal Codex identifier |  
+| `repository_url` | All cloud actions | HTTPS URL to repository |  
+| `environment_id` | cloud_scans,cloud_start | Environment for scan context |  
+| `lookback_days` | cloud_start | How far back to analyze (default: 30) |  
+
+### 31.J Security Settings Configuration
+
+```yaml
+# settings.yml security section
+security:
+    enabled: false                   # 默认关闭；开启 OMP-native 扫描系统
+
+memory.backend: 'off'               # 'local'|'mnemopi'|'hindsight'|'off'
+providers.tinyModelDevice: cpu      # GPU/CPU for ONNX inference
+providers.tinyModelDtype: q4        # Precision selection (fp16/bf32/q4)
+
+task:
+    max_recursion_depth: 2          # Subagent depth limit
+    isolation_mode: 'none'          # 'none' | 'auto' | 'apfs' | 'btrfs' | 'zfs' | 'reflink' | 'overlayfs' | 'projfs' | 'block-clone' | 'rcopy'
+```
+
+### 31.K Security Tool Actions Reference
+
+| Action | Required Parameters | Optional Parameters | Description |  
+|--------|---------------------|--------------------|-------------|  
+| `preflight` | None (auto-detect) | target_kind, include_paths, knowledge_base_paths, output_root, archive_existing, credential_id | Create immutable plan |  
+| `start` | `plan_id` | operation_id? | Execute the scan as job |  
+| `status` | `operation_id` | None | Get current progress snapshot |  
+| `cancel` | `operation_id`  | None | Abort running operation |  
+| `validate`  | finding_id, validation_status, validation_summary | validation_evidence[] | Update finding status with evidence |  
+
+**Cloud Actions**:
+| Action | Parameters | Notes |  
+|--------|-----------|-------|  
+| `cloud_scans`  | credential_id? | Lists available configurations for selected OAuth account |  
+| `cloud_start`  | repository_url,environment_id，lookback_days  | Starts cloud scan (consumes allowance) |  
+| `cloud_status`  | cloud_configuration_id | Gets progress metrics from cloud |  
+| `cloud_pull`   | cloud_configuration_id, archive_existing? | Imports findings to local store |  
+
+---
+
+## 32. Key Design Principles Summary
+
+### Security Architecture Decisions
+
+1. **Immutable Plans**: Each scan plan is pinned to a specific repository snapshot + model version + OAuth credential, preventing tampering mid-scan
+2. **Separation of Native/Cloud**: Cloud operations are separate workflows with their own quota; native scanning never falls back to cloud  
+3. **Evidence Chain Integrity**: All findings require validated evidence chains for auditability and reproducibility  
+4. **Recovery from Interruption**: Automatic detection and recovery from process crashes, preserving partial results when possible
+
+### Worker Isolation Decisions (v17+)
+
+| Decision | Rationale | Impact |
+|----------|-----------|--------|
+| ML workers in subprocesses | Prevent N-API terminator crash (#160) | Independent lifecycle management |  
+| Audio/ML isolation | Each worker has isolated memory heap | Crashes don't affect main process |  
+| Thread-based for fast ops | Stats, terminal output need low latency | Shared memory communication |  
+
+### Provider Registry Decisions
+
+| Before (v17-) | After (v12+) | Benefit |
+|---------------|--------------|---------|  
+| Monolithic `providers/` dir | Separated protocol + registry layers | Easier to add new vendors without touching core implementations |  
+| Hard-coded vendor list | Plugin-based registration via `registry/*.ts` | Dynamic loading, easier testing isolation |  
+
+---
+
+*End of Architecture Analysis Document — v17.2.4.*
