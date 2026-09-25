@@ -10,6 +10,11 @@
 
 **Oh My Pi (OMP)** 是一款 AI 编程代理 CLI 工具，提供 `read`、`bash`、`edit`、`write` 等工具并与 LLM 进行交互式会话。项目基于 **Bun** 运行时，采用 **Monorepo** 架构，包含 16 个 TypeScript 包和 11 个 Rust crate（另含 `vendor/` 第三方代码）。构建支持 `bun build` 与 Bazel（`BUILD.bazel` / `MODULE.bazel`）双流水线。
 
+**与原始 Pi 的关系**: oh-my-pi (omp) 是 [pi-mono](https://github.com/badlogic/pi-mono)（Mario Zechner）的 fork，重写为 coding-first 表面。核心沿用 Pi 的架构与包名（agent loop、LLM 客户端、TUI、扩展模型、会话机制；`pi-ai`/`pi-agent-core`/`pi-tui`/`pi-utils`/`pi-natives`），但已深度分叉，不再同步 upstream。
+
+- **重写**: 原生工具链全部 in-process（grep/glob/find/brush bash + 58 coreutils，零 fork/exec；Pi 原版 shell out 到 rg/find/bash）；新增 Rust crate `pi-edit`（编辑引擎）、`pi-vcs`、`pi-voice` 等
+- **扩展**: subagents/task + wait、stats 仪表盘、mnemopi/hindsight 记忆、协作系统 + collab-web、browser/computer eval preludes + browser-relay (Chrome 扩展)、ACP/IRC、metaharness benchmark、Bazel 构建
+
 ### 1.1 核心数据流
 
 ```
