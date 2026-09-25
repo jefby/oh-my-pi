@@ -12,6 +12,8 @@
 - `packages/natives/native/loader-state.js` and `loader-state.d.ts`
 - `packages/natives/native/desktop.js` and `desktop.d.ts`
 - `packages/natives/native/clipboard.js` and `clipboard.d.ts`
+- `packages/natives/native/vcs.js` and `vcs.d.ts`
+- `packages/natives/native/desktop-adapter.js` and `version-sentinel.js`
 - `packages/natives/native/embedded-addon.js`
 - `packages/natives/scripts/build-bindings.ts`
 - `packages/natives/scripts/embed-native.ts`
@@ -22,19 +24,20 @@
 
 ## Package entrypoints
 
-The package exports three entrypoints:
+The package exports these entrypoints:
 
 | Import                           | Runtime               | Types                   | Load behavior                                                                           |
 | -------------------------------- | --------------------- | ----------------------- | --------------------------------------------------------------------------------------- |
 | `@oh-my-pi/pi-natives`           | `native/index.js`     | `native/index.d.ts`     | Loads the addon immediately, then binds every generated class/function and enum object. |
 | `@oh-my-pi/pi-natives/desktop`   | `native/desktop.js`   | `native/desktop.d.ts`   | Exposes `createDesktopSession(options)` and defers addon loading until it is called.    |
 | `@oh-my-pi/pi-natives/clipboard` | `native/clipboard.js` | `native/clipboard.d.ts` | Exposes lazy `copyToClipboard` and `readImageFromClipboard` wrappers.                   |
+| `@oh-my-pi/pi-natives/vcs` | `native/vcs.js` | `native/vcs.d.ts` | Lazy VCS wrapper — in-process Git/Jujutsu ops + `VcsError` type guard.                |
 
 There is no `packages/natives/src` wrapper layer. Root consumers call generated N-API exports directly. The lazy subpaths exist so workers can import their JS wrapper without loading the large addon before the relevant operation initializes.
 
 Current root capabilities include:
 
-- search, globbing, workspace scans, AST matching/editing, code summaries, syntax highlighting, text layout, token counting, and structured diffs;
+- search, globbing, workspace scans, AST matching/editing, Mermaid diagram rendering, code summaries, syntax highlighting, text layout, token counting, and structured diffs;
 - shell, PTY, process, file-lock, isolation, and work-profile primitives;
 - desktop capture/input/accessibility, clipboard, audio capture/playback, live WebRTC, device-check, SIXEL, snapcompact rendering, and vector ranking;
 - PDF inspection/Markdown conversion, SVG rasterization, macOS spelling services, and in-process Git/Jujutsu operations.
@@ -82,9 +85,9 @@ Set `PI_DEBUG_STARTUP` to emit synchronous `[startup]` markers to stderr around 
 
 `crates/pi-natives/src/lib.rs` registers the current modules:
 
-- platform/runtime: `appearance`, `clipboard`, `crash_handler`, `desktop`, `devicecheck`, `file_lock`, `iofs`, `power`, `prof`, `ps`, `pty`, `shell`, `spelling`, `tty_writer`, `vcs`;
+- platform/runtime: `appearance`, `applefm` (Apple Foundation Models), `clipboard`, `crash_handler`, `desktop`, `devicecheck`, `file_lock`, `iofs`, `oauth_callback` (OAuth redirect server), `power`, `prof`, `ps`, `pty`, `shell`, `spelling`, `tty_writer`, `vcs`;
 - media/live: `audio`, `live`, `sixel`, `snapcompact`, `svg`;
-- code/data: `ast`, `block`, `diff`, `fd`, `glob`, `glob_util`, `grep`, `highlight`, `html`, `keys`, `pdf`, `summary`, `text`, `tokens`, `utok`, `vectors`, `workspace`;
+- code/data: `ast`, `block`, `diff`, `edit` (Rust edit engine, `EditSession`), `fd`, `glob`, `glob_util`, `grep`, `highlight`, `html`, `keys`, `mermaid` (Mermaid → ASCII/Unicode renderer), `pdf`, `summary`, `text`, `tokens`, `utok`, `vectors`, `workspace`;
 - isolation/task support: `iso`, `task`, plus N-API boundary/conversion helpers (`js`, crate-private `utils`, test-only `testing`);
 - language metadata re-exported from `pi_ast::language`.
 

@@ -126,7 +126,7 @@ Behavior:
 3. A per-line column cap can drop bytes from long lines in the LLM-facing buffer; when this happens, artifact mirroring starts so the on-disk file keeps the full sanitized stream.
 4. When the in-memory tail buffer would exceed spill threshold (`DEFAULT_MAX_BYTES`, 50KB), sink marks output truncated and starts artifact mirroring if an artifact path is available.
 5. If a file sink is opened, it first writes the current buffer, then all queued/subsequent sanitized chunks.
-6. In-memory buffer is trimmed to a tail window, or to head + elision marker + tail when head retention is configured.
+6. In-memory buffer is trimmed to a tail window, or to head + elision marker + tail when head retention is configured (settings-driven: `tools.artifactHeadBytes`, default 3 MiB, clamped to `artifactMaxBytes`).
 7. `dump()` finalizes the capture and returns `artifactId` only when no artifact I/O failure was observed. `artifactError` records the first failed operation (`open`, `write`, `flush`, or `end`) without persisting raw filesystem error text.
 
 Practical effect:
@@ -244,7 +244,7 @@ The two systems intersect only indirectly: both reduce session JSONL bloat, but 
 
 - [`src/session/blob-store.ts`](../packages/coding-agent/src/session/blob-store.ts) — blob reference format, hashing, put/get, externalize/resolve helpers.
 - [`src/session/artifacts.ts`](../packages/coding-agent/src/session/artifacts.ts) — session artifact directory model and numeric artifact ID/path allocation.
-- [`src/session/streaming-output.ts`](../packages/coding-agent/src/session/streaming-output.ts) — `OutputSink` truncation/spill-to-file behavior and summary metadata.
+- [`packages/tui/src/tools/streaming-output.ts`](../packages/tui/src/tools/streaming-output.ts) — `OutputSink` truncation/spill-to-file behavior and summary metadata (moved out of session/ in 18.x).
 - [`src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts) — `BlobStore`/`ArtifactManager` construction, persistence-transform and blob-rehydration call sites, session fork/move interactions.
 - [`src/session/session-persistence.ts`](../packages/coding-agent/src/session/session-persistence.ts) — `prepareEntryForPersistence()`: large-string truncation, transient-field stripping, and synchronous image-blob externalization.
 - [`src/session/session-loader.ts`](../packages/coding-agent/src/session/session-loader.ts) — `resolveBlobRefsInEntries()`: blob-ref rehydration to base64 / data URLs on load.
