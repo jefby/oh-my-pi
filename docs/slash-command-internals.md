@@ -7,16 +7,21 @@ This document describes how slash commands are discovered, deduplicated, surface
 - [`src/extensibility/slash-commands.ts`](../packages/coding-agent/src/extensibility/slash-commands.ts)
 - [`src/capability/slash-command.ts`](../packages/coding-agent/src/capability/slash-command.ts)
 - [`src/discovery/builtin.ts`](../packages/coding-agent/src/discovery/builtin.ts)
+- [`src/discovery/omp-plugins.ts`](../packages/coding-agent/src/discovery/omp-plugins.ts)
 - [`src/discovery/claude.ts`](../packages/coding-agent/src/discovery/claude.ts)
 - [`src/discovery/codex.ts`](../packages/coding-agent/src/discovery/codex.ts)
 - [`src/discovery/claude-plugins.ts`](../packages/coding-agent/src/discovery/claude-plugins.ts)
+- [`src/discovery/agents.ts`](../packages/coding-agent/src/discovery/agents.ts)
+- [`src/discovery/opencode.ts`](../packages/coding-agent/src/discovery/opencode.ts)
 - [`src/capability/index.ts`](../packages/coding-agent/src/capability/index.ts)
 - [`src/discovery/helpers.ts`](../packages/coding-agent/src/discovery/helpers.ts)
+- [`src/slash-commands/builtin-registry.ts`](../packages/coding-agent/src/slash-commands/builtin-registry.ts)
+- [`src/slash-commands/acp-builtins.ts`](../packages/coding-agent/src/slash-commands/acp-builtins.ts)
+- [`src/slash-commands/available-commands.ts`](../packages/coding-agent/src/slash-commands/available-commands.ts)
 - [`src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`src/modes/interactive-mode.ts`](../packages/coding-agent/src/modes/interactive-mode.ts)
 - [`src/modes/controllers/input-controller.ts`](../packages/coding-agent/src/modes/controllers/input-controller.ts)
 - [`src/modes/utils/ui-helpers.ts`](../packages/coding-agent/src/modes/utils/ui-helpers.ts)
-- [`src/modes/controllers/command-controller.ts`](../packages/coding-agent/src/modes/controllers/command-controller.ts)
 
 ## 1) Discovery model
 
@@ -47,6 +52,8 @@ For `slash-commands`, collisions are resolved strictly by capability dedup:
 
 This applies across providers and also within a provider if it returns duplicate names.
 
+Built-ins are not items in this file capability. They live in the unified built-in registry and are dispatched before session-level extension/custom/file expansion in TUI and ACP/RPC modes. Autocomplete/ACP availability also reserves built-in names and aliases first.
+
 ### File scanning behavior
 
 Providers mostly use `loadFilesFromDir(...)`, which currently:
@@ -64,9 +71,13 @@ So hidden files/directories are not loaded, ignored paths are skipped, and file 
 Search roots come from `.omp` directories:
 
 - project: `<cwd>/.omp/commands/*.md`
-- user: `~/.omp/agent/commands/*.md`
+- user: active profile agent directory `commands/*.md` (`~/.omp/agent/commands/*.md` for the default profile; `~/.omp/profiles/<name>/agent/commands/*.md` for a named profile)
 
 `getConfigDirs()` returns project first, then user, so **project native commands beat user native commands** when names collide.
+
+## `omp-plugins` provider (`omp-plugins.ts`)
+
+Scans `commands/*.md` in configured extension-package roots and enabled npm/link plugins. Root precedence is invocation/CLI, project settings, user settings, then installed plugins. Marketplace roots are excluded here to avoid duplicate discovery and are handled by `claude-plugins`.
 
 ## `claude` provider (`claude.ts`)
 
@@ -105,6 +116,10 @@ Loads plugin command roots via `listClaudePluginRoots(...)`, which reads `~/.cla
 
 Across the three registries, roots are merged by precedence rather than sorted: `--plugin-dir` injected roots come first, then project-scoped entries (which shadow user entries for the same plugin id), then user entries, with the OMP registry authoritative over Claude's for the same plugin id. Within each registry, per-plugin entry order from the JSON data is preserved; there is no additional sort step.
 
+## `agents` provider (`agents.ts`)
+
+Scans non-recursive `commands/*.md` under `.agent/` and `.agents/` from cwd up to the repository root, then `~/.agent/commands` and `~/.agents/commands`. Within this provider, the nearest project root is first; `.agent` precedes `.agents`; project entries precede user entries.
+
 ## 3) Materialization to runtime `FileSlashCommand`
 
 `loadSlashCommands()` in `src/extensibility/slash-commands.ts` converts capability items into `FileSlashCommand` objects used at prompt time.
@@ -118,10 +133,11 @@ For each command:
 3. keep parsed body as executable template content
 4. compute a display source string like `via Claude Code Project`
 
-Frontmatter parse severity is source-dependent:
+Frontmatter parse severity is level-dependent:
 
-- `native` level -> parse errors are `fatal`
-- `user`/`project` levels -> parse errors are `warn` with fallback parsing
+- discovered user/project commands use warning-level parsing with fallback key/value parsing
+- a capability item explicitly marked `native` would use fatal parsing
+- bundled fallback templates use fatal parsing
 
 ### Bundled fallback commands
 
@@ -153,8 +169,9 @@ Then `init()` calls `refreshSlashCommandState(...)` to load file-based commands 
 Slash command state is refreshed:
 
 - during interactive init
-- after `/move` changes working directory (`handleMoveCommand` -> `applyCwdChange`, which calls `resetCapabilities()` then `refreshSlashCommandState(newCwd)`)
-- when the editor component is swapped (`setEditorComponent` re-runs `refreshSlashCommandState()`)
+- after `/move` changes working directory (`applyCwdChange` resets capabilities and refreshes against the new cwd)
+- when the editor component is swapped
+- by explicit plugin reload flows such as `/reload-plugins`
 
 There is no continuous file watcher for command directories.
 
@@ -162,14 +179,16 @@ There is no continuous file watcher for command directories.
 
 The Extensions dashboard also loads `slash-commands` capability and displays active/shadowed command entries, including `_shadowed` duplicates.
 
-## 5) Prompt pipeline placement
+## 5) Routing and prompt-pipeline placement
 
-`AgentSession.prompt(...)` slash handling order (when `expandPromptTemplates !== false`):
+The unified built-in registry is checked before `AgentSession.prompt(...)` in TUI and ACP/RPC modes. A built-in can consume input or return residual prompt text. TUI-only built-ins are omitted from ACP availability and dispatch; ACP-visible built-ins are the entries with a text-mode `handle`.
+
+After that boundary, `AgentSession.prompt(...)` processes slash input in this order when `expandPromptTemplates !== false`:
 
 1. **Extension commands** (`#tryExecuteExtensionCommand`)  
-   If `/name` matches extension-registered command, handler executes immediately and prompt returns.
+   If `/name` matches an extension-registered command, its handler executes immediately and prompt returns.
 2. **TypeScript custom commands and MCP prompt commands** (`#tryExecuteCustomCommand`)
-   Boundary only: if matched, it executes and may return:
+   A match may return:
    - `string` -> replace prompt text with that string
    - `void/undefined` -> treated as handled; no LLM prompt
 3. **File-based slash commands** (`expandSlashCommand`)  
@@ -180,7 +199,7 @@ The Extensions dashboard also loads `slash-commands` capability and displays act
    - idle: prompt is sent immediately to agent
    - streaming: prompt is queued as steer/follow-up depending on `streamingBehavior`
 
-This is why slash command expansion sits before prompt-template expansion, and why custom commands can transform away the leading slash before file-command matching.
+This is why built-ins reserve their names before file commands are considered, slash command expansion sits before prompt-template expansion, and custom commands can transform away the leading slash before file-command matching.
 
 ## 6) Expansion semantics for file-based slash commands
 
@@ -210,9 +229,13 @@ The parser is simple quote-aware splitting:
 
 Unknown slash input is **not rejected** by core slash logic.
 
-If command is not handled by extension/custom/file layers, `expandSlashCommand` returns original text, and the literal `/...` prompt proceeds through normal prompt-template expansion and LLM delivery.
+If no built-in, extension, custom, or file command handles it, `expandSlashCommand` returns the original text and the literal `/...` prompt proceeds through prompt-template expansion and LLM delivery.
 
-Interactive mode separately hard-handles many built-ins in `InputController` (for example `/settings`, `/model`, `/mcp`, `/move`, `/exit`). Those are consumed before `session.prompt(...)` and therefore never reach file-command expansion in that path.
+TUI and ACP/RPC dispatch the shared built-in registry before `session.prompt(...)`. A TUI-only built-in is not advertised or handled in ACP, so an otherwise unhandled spelling can still fall through as ordinary prompt text there.
+
+## ACP/RPC availability
+
+`buildAvailableSlashCommands(...)` publishes commands first-wins in this order: text-capable built-ins, optional skill commands, extension commands, TypeScript/MCP custom commands, then discovered file commands. Built-in primary names and aliases are reserved; extension names such as `model:foo`, whose prefix parses as a built-in, are filtered from ACP availability. The same file-command load updates the session expansion set.
 
 ## 8) Streaming-time differences vs idle
 
@@ -242,3 +265,161 @@ Interactive mode separately hard-handles many built-ins in `InputController` (fo
   - native commands: fatal parse error bubbles
   - non-native commands: warning + fallback key/value parse
 - Extension/custom command handler exceptions are caught and reported via extension error channel (or logger fallback for custom commands without extension runner), and treated as handled (no unintended fallback execution).
+
+## 10) Built-in command note: `/pause`
+
+`/pause` is available only in the interactive TUI. It engages a process-global gate for the main agent, in-process subagents, and the advisor. Each agent parks at its next safe boundary: in-flight calls finish, nothing is aborted, and no new work starts until the gate is released.
+
+From the pause screen, press Esc, Enter, Space, or Ctrl+C to resume. Ctrl+C resumes rather than aborting any agent.
+
+## 11) Built-in command note: `/btw`
+
+`/btw <question>` asks an independent side question using the current session
+context. Bare `/btw` opens this session's history, with the newest question selected.
+Saved side questions are not appended to the main transcript or sent as history
+to unrelated turns. Each new `/btw <question>` remains independent; explicit
+follow-ups include only the selected side conversation alongside the current
+main-session context.
+
+Previous questions and answers are replayed as separate `user` and `assistant`
+messages, followed by the new user question, rather than embedded in one prompt.
+The original question template stays in the same position across follow-ups.
+History is snapshotted before asynchronous conversion and uses the normal
+provider normalization and secret-obfuscation pipeline.
+
+The main prompt-cache key and static system/tool prefix are retained. Each BTW
+topic has its own stable provider-side conversation identity, separate from the
+main conversation and other topics. Successful serialized follow-ups reuse it;
+after a cancelled, failed, or interrupted turn the next request uses a new
+transport generation, so an unwinding request cannot share its state.
+Standalone ephemeral callers without a conversation key keep per-request IDs.
+Actual cache hits depend on the provider. The main-session context is still
+current, not frozen at the first question; advancing or compacting it can change
+the prefix.
+Saved BTW records contain visible answer text, not opaque provider reasoning or
+replay signatures, so restoration preserves the dialogue roles and text rather
+than a byte-for-byte native provider transcript.
+
+- While an inline BTW is running, `Esc` cancels the request and keeps its partial
+  answer visible as `Cancelled`. Press `Esc` again to close the panel.
+- In history, `Esc` cancels the selected running topic without closing history;
+  otherwise it closes history. If another topic is still running, its inline
+  panel is restored rather than leaving it hidden in the background.
+- Completed, cancelled, and failed panels close with `Esc`; their history stays
+  saved. There is no hide-and-continue action or separate `x` cancellation key.
+- `c` copies the completed inline answer, or the selected topic's latest nonempty answer.
+- After an inline BTW answer completes, `f` opens that topic's follow-up input
+  directly, without requiring `/btw` first. The main editor must be empty and focused.
+- In history, `f` or `Enter` opens a native follow-up input for the selected topic.
+  Inside the input, `Enter` sends a nonempty question and `Esc` cancels the draft
+  and returns to history; `f`, `c`, and `x` are ordinary text.
+  Escape also cancels a submitted follow-up while its startup writes are pending,
+  without starting a model request. If its initial checkpoint was already underway,
+  the turn is saved as cancelled before another follow-up can start.
+- Follow-ups append to the same topic, retain prior answers and cancelled partial
+  output, and survive resume. The original question remains the history-list title;
+  `Details` shows every question and answer in chronological order.
+- In history, `Up`/`Down` select topics; `Tab` switches between history and
+  details. `Right` focuses details, `Left` returns to history.
+- Focused details support scrolling, `Page Up`/`Page Down`, and `Home`/`End`.
+  Narrow terminals show one pane at a time.
+- New questions and follow-ups are refused while any BTW request is running.
+  There is no implicit cancellation or queue.
+- A refused follow-up submission keeps the draft for retry; repeated Enter while
+  submission is pending cannot create duplicate requests.
+
+History is saved as private per-topic files under the session artifact
+directory's `btw-history/` subdirectory. This changes `/btw` from transient-only
+display to local retention alongside the session. Even a session containing only
+side questions is made resumable. `--no-session` keeps history in memory only.
+Ordinary transcript export/share does not include these sidecar records.
+
+Each topic uses an OS-backed cross-process lease and a revision check before an
+atomic replacement. Running turns keep their lease until a terminal checkpoint;
+another process cannot overwrite a live owner or a stale topic snapshot. A
+conflicting follow-up is rejected before any model request, and reopening or
+retrying reads the latest saved history. Rejected writes never replace the
+committed in-memory view.
+Root and follow-up timestamps must be nonnegative and within JavaScript's supported
+Date range (at most `8.64e15` milliseconds); invalid records are rejected before
+history rendering.
+
+Migration is non-destructive until the destination has been selected and
+validated. `/move`, `/wt`, and standalone persistent `!cd` refuse relocation while
+a BTW request is starting or running, asking the operator to finish or cancel it explicitly.
+For `/move`, the same gate is acquired before confirming or creating a missing
+destination directory and remains held through relocation. A busy request or
+unsaved checkpoint therefore leaves neither a new directory nor a moved session.
+The `/wt` gate is acquired before creating a branch or checkout and remains held
+through session relocation and configured source cleanup, so a busy refusal does
+not leave an unused worktree.
+The `!cd` guard runs before shell execution and remains held through cwd adoption
+or rollback, so a refused command cannot leave the shell in a different directory.
+Cancelled pickers, invalid destinations, and failed moves retain the BTW conversation.
+Successful relocation clears the old view only after moving the saved artifacts.
+
+Resuming from a path, the session picker, or an imported session cancels BTW and
+waits for its terminal checkpoint before switching. Confirmed deletion of the
+active session uses the same cleanup before detaching and removing its artifacts.
+Failed BTW persistence leaves the source session and its artifacts intact.
+Declining deletion or deleting an inactive session does not cancel the current BTW.
+Extension commands using `context.newSession`, `context.switchSession`, or
+`context.branch` also run this cleanup before changing session state or clearing
+extension UI. This applies both when extensions initialize and when their command
+context is reinitialized.
+
+Session operations wait at most 10 seconds for outstanding BTW persistence.
+A timeout stops the operation and leaves the current session in place; it does
+not cancel the underlying filesystem write or allow migration/deletion to run
+later when that write completes. A failed terminal checkpoint also stops these
+operations after its pending promise has settled; the unsaved answer remains
+available to view and copy. Retrying the operation retries the retained snapshot
+against its original disk revision. Transient I/O failures can recover, but a
+conflict never silently rebases over another writer's changes. An initial
+checkpoint rejection still prevents model dispatch and can reload history normally.
+Visible BTW errors use bounded, single-line text with control sequences removed
+and embedded home paths shortened; original errors remain available in diagnostic
+logs and exception causes for troubleshooting.
+
+Starting a question saves its running state. Completion, error, and explicit
+cancellation save a final checkpoint; cancelled answers retain text already
+received. A crash can lose uncheckpointed streaming text, but a saved running
+record reopens as `Interrupted` and is never automatically resubmitted.
+History remains attached to the session artifacts and follows operations that
+copy or remove those artifacts; it does not move the conversation leaf.
+
+The existing inline `b` action promotes a completed single-turn answer to a chat
+branch only when the original session/leaf is unchanged and the main session is
+idle. Multi-turn side conversations remain in BTW history; promoting only their
+latest pair would discard earlier context. History browsing does not promote
+answers or relax these branch guards.
+
+## 12) Bundled command note: `/annotate`
+
+`/annotate` lets the operator attach notes to a diff or text before the agent acts. With no argument it opens a source menu.
+
+| Command | Source |
+|---|---|
+| `/annotate code-review [focus]` | Local base-branch, working-copy, or commit diff, or a GitHub PR |
+| `/annotate last` | Latest non-empty assistant reply on the active branch |
+| `/annotate session` | A message or block picked in the `/copy` selector |
+| `/annotate path/to/file` | Text read from a file |
+| `/annotate "text"` | Literal text |
+
+The whole remainder after `/annotate` is one source specification (`CustomCommand.execute` receives it verbatim as `rawArgs`):
+
+- A remainder wrapped in matching `"` or `'` is literal text; only the outer pair is stripped and the interior is kept byte-for-byte.
+- Unquoted `last`, `session`, and `code-review …` select those modes. To annotate a file whose path starts with one of these words, prefix it with `./` (for example `/annotate ./code-review notes.md`).
+- Anything else is one file path, spaces included, resolved with `resolveReadPath` against the live session cwd. Missing or non-regular paths notify and never fall back to literal text.
+
+Argument completion offers the modes, a `./` file-path starter, and a quote starter. `CustomCommand.getArgumentCompletions(prefix, cwd)` receives the live session cwd, so file suggestions follow `/move` and `/wt`.
+
+**Code review.** The menu lists up to three GitHub PRs referenced in the conversation, then the local diff kinds. `/annotate code-review pr://owner/repo/N [focus]` skips the menu. The diff is resolved once in the live session cwd and frozen (`ResolvedReviewTarget`); the overlay and the reviewer prompt read the same snapshot, filtered by the same exclusion rules as `/review` (`bundled/review/diff.ts`). The overlay offers **Continue with LLM review** (submits the `/review` prompt with the notes as operator focus) and **Paste annotations into prompt**. Both include the optional `[focus]` text. Nothing is posted to GitHub.
+
+**Text sources.** Feedback is always pasted into the composer, never submitted. File and literal sources are embedded verbatim. The latest reply is referenced as "your last reply" and only the annotated lines are quoted. An older session message longer than 1,000 characters is condensed by one call to the current session model (its credentials, no fallback model); if that call fails or returns an unusable result, the full source is embedded with a warning.
+
+**Overlay keys.** `a` adds a line note, `A` a whole-file/whole-text note, `e` edits the note(s) at the cursor (with a chooser when several apply), `u` undoes the last add/edit/delete. In the note editor, Enter saves, Shift+Enter inserts a newline, Escape discards the draft, and the configured external-editor key replaces the draft without saving it. Notes are trimmed on save; saving an empty edit deletes the note, and an empty new note is ignored. Line anchors (quoted source line, diff hunk header and raw row) are kept exactly.
+
+## 13) Built-in command note: `/plan-review`
+
+`/plan-review` reopens the Plan Review overlay for the latest plan (plan mode only). In the Contents sidebar `a` annotates the selected section; in the plan body `a` annotates the top visible line. `e` edits the annotation(s) at that section or line (with a chooser when several apply) and `u` undoes the latest section deletion or annotation change. The note editor behaves like `/annotate`'s: Enter saves, Shift+Enter inserts a newline, Escape discards the draft, the external-editor key replaces the draft without saving, and saving an empty edit deletes the annotation.

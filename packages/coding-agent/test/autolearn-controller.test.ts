@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentOptions, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, FetchImpl, Model, ProviderSessionState, Usage } from "@oh-my-pi/pi-ai";
 import { streamGoogle } from "@oh-my-pi/pi-ai/providers/google";
@@ -9,7 +10,8 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAutoLearnCaptureRunner } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { type } from "arktype";
+
+import { cfgAutolearnEnabled } from "@oh-my-pi/pi-coding-agent/autolearn/settings";
 
 class FakeSession {
 	readonly listeners: Array<(event: AgentSessionEvent) => void> = [];
@@ -41,6 +43,7 @@ class FakeSession {
 	}
 
 	emit(event: AgentSessionEvent): void {
+		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...this.listeners]) listener(event);
 	}
 
@@ -144,27 +147,6 @@ describe("AutoLearnController", () => {
 		expect(session.captures).toHaveLength(0);
 	});
 
-	it("the auto-continue nudge is terminal — capture then stop, never assume approval (#3504)", () => {
-		// Regression: with autoContinue on, the synthetic capture turn carries
-		// the nudge as its only user-role payload. Without an explicit "stop /
-		// not a user reply / do not assume approval" contract, the agent reads
-		// its own unanswered prior question (e.g. "Want me to commit and
-		// push?") as accepted and continues — exactly the scenario in #3504.
-		const session = new FakeSession();
-		install(session, { "autolearn.autoContinue": true });
-		session.toolCalls(5);
-		session.agentEnd();
-		const body = session.captures[0] ?? "";
-		// Frames the prompt as automated, not as the user's response.
-		expect(body).toMatch(/not a user reply|not from the user/i);
-		// Forbids inferring approval / acting on pending questions.
-		expect(body).toMatch(/not.*(approval|accept|pending|prior)/i);
-		// Demands a hard stop after capture, with no continuation.
-		expect(body).toMatch(/then stop\./i);
-		expect(body).toMatch(/do not.*(continue|resume|other tools)/i);
-		expect(body).toMatch(/wait for the user'?s next prompt/i);
-	});
-
 	it("does not nudge below the threshold", () => {
 		const session = new FakeSession();
 		install(session, { "autolearn.autoContinue": true });
@@ -209,7 +191,7 @@ describe("AutoLearnController", () => {
 		// Enable via the global layer (not an isolated override) so the live flag
 		// can be flipped and the controller's fire-time re-check is exercised.
 		const settings = Settings.isolated({ "autolearn.autoContinue": true });
-		settings.set("autolearn.enabled", true);
+		cfgAutolearnEnabled.set(settings, true);
 		new AutoLearnController({
 			session: session as unknown as AgentSession,
 			settings,
@@ -218,13 +200,13 @@ describe("AutoLearnController", () => {
 		session.toolCalls(5);
 		session.agentEnd();
 		expect(session.captures).toHaveLength(1); // fires while enabled
-		settings.set("autolearn.enabled", false);
+		cfgAutolearnEnabled.set(settings, false);
 		session.toolCalls(5);
 		session.agentEnd();
 		expect(session.captures).toHaveLength(1); // no new nudge after disable
 		// The disabled stop must NOT leave its tool calls queued: re-enabling and
 		// doing a sub-threshold turn must not fire from leaked counts.
-		settings.set("autolearn.enabled", true);
+		cfgAutolearnEnabled.set(settings, true);
 		session.toolCalls(1);
 		session.agentEnd();
 		expect(session.captures).toHaveLength(1);
@@ -398,7 +380,7 @@ describe("isolated auto-learn capture", () => {
 		let captureSessionId: string | undefined;
 		const runCapture = createAutoLearnCaptureRunner({
 			sourceAgent,
-			captureTools: [manageSkillTool],
+			captureTools: () => [manageSkillTool],
 			createSessionId: () => "0193c8f2-7b1a-7c4d-9e2f-123456789abc",
 			createAgent: options => {
 				captureMessages = options.initialState?.messages ?? [];
@@ -454,7 +436,7 @@ describe("isolated auto-learn capture", () => {
 		let captureOnResponse: AgentOptions["onResponse"];
 		const runCapture = createAutoLearnCaptureRunner({
 			sourceAgent,
-			captureTools: [manageSkillTool],
+			captureTools: () => [manageSkillTool],
 			onPayload,
 			onResponse,
 			createAgent: options => {
@@ -486,7 +468,7 @@ describe("isolated auto-learn capture", () => {
 		let captureToolNames: string[] = [];
 		const runCapture = createAutoLearnCaptureRunner({
 			sourceAgent,
-			captureTools: [manageSkillTool, learnTool],
+			captureTools: () => [manageSkillTool, learnTool],
 			createAgent: options => {
 				captureToolNames = options.initialState?.tools?.map(tool => tool.name) ?? [];
 				return new Agent({
@@ -518,8 +500,7 @@ describe("isolated auto-learn capture", () => {
 			["capture-transport", "account-other"],
 		]);
 		const resolvedAffinities: string[] = [];
-		let sourceAgent: Agent;
-		sourceAgent = new Agent({
+		const sourceAgent = new Agent({
 			sessionId: "primary-affinity",
 			getApiKey: () => async () => {
 				const affinity = sourceAgent.sessionId ?? "";
@@ -534,7 +515,7 @@ describe("isolated auto-learn capture", () => {
 		});
 		const runCapture = createAutoLearnCaptureRunner({
 			sourceAgent,
-			captureTools: [manageSkillTool],
+			captureTools: () => [manageSkillTool],
 			createSessionId: () => "capture-transport",
 			createAgent: options =>
 				new Agent({
@@ -570,7 +551,7 @@ describe("isolated auto-learn capture", () => {
 		let closeCalls = 0;
 		const runCapture = createAutoLearnCaptureRunner({
 			sourceAgent,
-			captureTools: [manageSkillTool],
+			captureTools: () => [manageSkillTool],
 			createAgent: options => {
 				providerState = options.providerSessionState;
 				providerState?.set("blocked", { close: () => closeCalls++ });

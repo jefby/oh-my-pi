@@ -4,7 +4,7 @@ import base64
 import mimetypes
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypedDict, TypeAlias, cast
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -19,9 +19,12 @@ StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
+PromptStatus: TypeAlias = Literal["completed", "aborted", "error"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
-TodoStatus: TypeAlias = Literal["pending", "in_progress", "completed", "abandoned"]
+TodoStatus: TypeAlias = Literal[
+    "pending", "in_progress", "completed", "abandoned", "blocked"
+]
 ExtensionUiMethod: TypeAlias = Literal[
     "select",
     "confirm",
@@ -33,17 +36,30 @@ ExtensionUiMethod: TypeAlias = Literal[
     "setWidget",
     "setTitle",
     "set_editor_text",
+    "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal[
     "select", "confirm", "input", "editor"
 ]
 PassiveExtensionUiMethod: TypeAlias = Literal[
-    "notify", "setStatus", "setWidget", "setTitle", "set_editor_text"
+    "notify",
+    "setStatus",
+    "setWidget",
+    "setTitle",
+    "set_editor_text",
+    "open_url",
 ]
 ValueExtensionUiMethod: TypeAlias = Literal["select", "input", "editor"]
 
 PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = frozenset(
-    {"notify", "setStatus", "setWidget", "setTitle", "set_editor_text"}
+    {
+        "notify",
+        "setStatus",
+        "setWidget",
+        "setTitle",
+        "set_editor_text",
+        "open_url",
+    }
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = (
     frozenset({"select", "confirm", "input", "editor"})
@@ -60,12 +76,15 @@ _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
+_PROMPT_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"completed", "aborted", "error"}
+)
 _NOTIFY_TYPE_VALUES: Final[frozenset[str]] = frozenset({"info", "warning", "error"})
 _WIDGET_PLACEMENT_VALUES: Final[frozenset[str]] = frozenset(
     {"aboveEditor", "belowEditor"}
 )
 _TODO_STATUS_VALUES: Final[frozenset[str]] = frozenset(
-    {"pending", "in_progress", "completed", "abandoned"}
+    {"pending", "in_progress", "completed", "abandoned", "blocked"}
 )
 _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
     {
@@ -79,6 +98,7 @@ _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
         "setWidget",
         "setTitle",
         "set_editor_text",
+        "open_url",
     }
 )
 _AGENT_MESSAGE_ROLE_VALUES: Final[frozenset[str]] = frozenset(
@@ -117,10 +137,10 @@ _ASSISTANT_DONE_REASON_VALUES: Final[frozenset[str]] = frozenset(
 )
 _ASSISTANT_ERROR_REASON_VALUES: Final[frozenset[str]] = frozenset({"aborted", "error"})
 _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset(
-    {"threshold", "overflow", "idle"}
+    {"threshold", "overflow", "idle", "incomplete"}
 )
 _AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset(
-    {"context-full", "handoff"}
+    {"context-full", "handoff", "shake", "snapcompact"}
 )
 
 
@@ -151,6 +171,16 @@ def _optional_json_object(value: object, *, field: str) -> JsonObject | None:
     return _clone_json_object(value, field=field)
 
 
+def _optional_json_objects(
+    values: object, *, field: str
+) -> tuple[JsonObject, ...] | None:
+    if values is None:
+        return None
+    if not isinstance(values, list):
+        raise ValueError(f"{field} must be a list")
+    return tuple(_clone_json_object(item, field=f"{field}[]") for item in values)
+
+
 def _clone_json_objects(values: object, *, field: str) -> tuple[JsonObject, ...]:
     if values is None:
         return ()
@@ -178,6 +208,13 @@ def _require_str(payload: JsonObject, field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
+    return value
+
+
+def _require_bool(payload: JsonObject, field: str) -> bool:
+    value = payload.get(field)
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
     return value
 
 
@@ -229,6 +266,15 @@ def _optional_int(payload: JsonObject, field: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer")
     return value
+
+
+def _optional_float(payload: JsonObject, field: str) -> float | None:
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    return float(value)
 
 
 def _tuple_of_strings(values: object, *, field: str) -> tuple[str, ...] | None:
@@ -291,12 +337,13 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
     )
     if event_type == "start":
         return AssistantMessageStartEvent(
+            type="start",
             partial=_parse_assistant_message(
                 _clone_json_object(
                     payload.get("partial"), field="assistantMessageEvent.partial"
                 ),
                 field="assistantMessageEvent.partial",
-            )
+            ),
         )
     if event_type in {"text_start", "thinking_start", "toolcall_start"}:
         partial = _parse_assistant_message(
@@ -309,12 +356,16 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
         if content_index is None:
             raise ValueError("assistantMessageEvent.contentIndex must be an integer")
         if event_type == "text_start":
-            return AssistantTextStartEvent(contentIndex=content_index, partial=partial)
+            return AssistantTextStartEvent(
+                type="text_start", contentIndex=content_index, partial=partial
+            )
         if event_type == "thinking_start":
             return AssistantThinkingStartEvent(
-                contentIndex=content_index, partial=partial
+                type="thinking_start", contentIndex=content_index, partial=partial
             )
-        return AssistantToolCallStartEvent(contentIndex=content_index, partial=partial)
+        return AssistantToolCallStartEvent(
+            type="toolcall_start", contentIndex=content_index, partial=partial
+        )
     if event_type in {"text_delta", "thinking_delta", "toolcall_delta"}:
         partial = _parse_assistant_message(
             _clone_json_object(
@@ -330,14 +381,23 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
             raise ValueError("assistantMessageEvent.delta must be a string")
         if event_type == "text_delta":
             return AssistantTextDeltaEvent(
-                contentIndex=content_index, delta=delta, partial=partial
+                type="text_delta",
+                contentIndex=content_index,
+                delta=delta,
+                partial=partial,
             )
         if event_type == "thinking_delta":
             return AssistantThinkingDeltaEvent(
-                contentIndex=content_index, delta=delta, partial=partial
+                type="thinking_delta",
+                contentIndex=content_index,
+                delta=delta,
+                partial=partial,
             )
         return AssistantToolCallDeltaEvent(
-            contentIndex=content_index, delta=delta, partial=partial
+            type="toolcall_delta",
+            contentIndex=content_index,
+            delta=delta,
+            partial=partial,
         )
     if event_type in {"text_end", "thinking_end"}:
         partial = _parse_assistant_message(
@@ -354,10 +414,16 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
             raise ValueError("assistantMessageEvent.content must be a string")
         if event_type == "text_end":
             return AssistantTextEndEvent(
-                contentIndex=content_index, content=content, partial=partial
+                type="text_end",
+                contentIndex=content_index,
+                content=content,
+                partial=partial,
             )
         return AssistantThinkingEndEvent(
-            contentIndex=content_index, content=content, partial=partial
+            type="thinking_end",
+            contentIndex=content_index,
+            content=content,
+            partial=partial,
         )
     if event_type == "toolcall_end":
         partial = _parse_assistant_message(
@@ -373,12 +439,14 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
             payload.get("toolCall"), field="assistantMessageEvent.toolCall"
         )
         return AssistantToolCallEndEvent(
+            type="toolcall_end",
             contentIndex=content_index,
             toolCall=cast(ToolCall, tool_call),
             partial=partial,
         )
     if event_type == "done":
         return AssistantDoneEvent(
+            type="done",
             reason=cast(
                 Literal["stop", "length", "toolUse"],
                 _require_literal(
@@ -395,6 +463,7 @@ def parse_assistant_message_event(payload: JsonObject) -> AssistantMessageEvent:
             ),
         )
     return AssistantErrorEvent(
+        type="error",
         reason=cast(
             Literal["aborted", "error"],
             _require_literal(
@@ -745,6 +814,8 @@ class TodoItem:
     status: TodoStatus
     notes: str | None = None
     details: str | None = None
+    # What a `blocked` task is waiting on; None for all other statuses.
+    blocker: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -752,6 +823,13 @@ class TodoPhase:
     id: str
     name: str
     tasks: tuple[TodoItem, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ContextUsage:
+    tokens: int
+    context_window: int
+    percent: float
 
 
 @dataclass(slots=True, frozen=True)
@@ -772,6 +850,14 @@ class SessionState:
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
+    fast_mode_enabled: bool = False
+    fast_mode_active: bool = False
+    tokens_per_second: float | None = None
+    context_usage: ContextUsage | None = None
+    has_pending_async_work: bool = False
+    """Background jobs or deliveries can still inject a follow-up and wake the session."""
+    is_settled: bool = False
+    """Idle with nothing queued or pending; same predicate as `session_settled`."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -785,6 +871,12 @@ class BashResult:
     output_lines: int
     output_bytes: int
     artifact_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class FastModeResult:
+    enabled: bool
+    active: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -812,6 +904,16 @@ class ThinkingLevelCycleResult:
 @dataclass(slots=True, frozen=True)
 class CancellationResult:
     cancelled: bool
+
+
+@dataclass(slots=True, frozen=True)
+class OpenSessionResult:
+    """`open_session` outcome; `resumed` is False when a fresh session was started."""
+
+    cancelled: bool
+    resumed: bool
+    session_id: str
+    session_file: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -872,6 +974,7 @@ class ExtensionUiRequest:
     title: str | None = None
     options: tuple[str, ...] | None = None
     message: str | None = None
+    option_details: tuple[JsonObject, ...] | None = field(default=None, kw_only=True)
     placeholder: str | None = None
     prefill: str | None = None
     timeout: int | None = None
@@ -884,6 +987,9 @@ class ExtensionUiRequest:
     widget_lines: tuple[str, ...] | None = None
     widget_placement: WidgetPlacement | None = None
     text: str | None = None
+    url: str | None = None
+    launch_url: str | None = None
+    instructions: str | None = None
     type: Literal["extension_ui_request"] = "extension_ui_request"
 
     def is_passive(self) -> bool:
@@ -917,6 +1023,11 @@ class AgentEndEvent:
     messages: tuple[AgentMessage, ...]
     type: Literal["agent_end"] = "agent_end"
     message_count: int | None = field(default=None, kw_only=True)
+    is_terminal: bool | None = field(default=None, kw_only=True)
+    yielded: bool | None = field(default=None, kw_only=True)
+    """True when the agent finished its turn (it resumes only for queued input or
+    background-job results); False while it continues its own work (retry,
+    compaction, stop-time reminders). None from older servers: use `is_terminal`."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -935,6 +1046,8 @@ class TurnEndEvent:
 class MessageStartEvent:
     message: AgentMessage
     type: Literal["message_start"] = "message_start"
+    message_id: str | None = field(default=None, kw_only=True)
+    """Shared by the start, updates, and end of one message; unique per process."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -942,12 +1055,14 @@ class MessageUpdateEvent:
     message: AgentMessage
     assistant_message_event: AssistantMessageEvent
     type: Literal["message_update"] = "message_update"
+    message_id: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
 class MessageEndEvent:
     message: AgentMessage
     type: Literal["message_end"] = "message_end"
+    message_id: str | None = field(default=None, kw_only=True)
 
 
 @dataclass(slots=True, frozen=True)
@@ -979,14 +1094,14 @@ class ToolExecutionEndEvent:
 
 @dataclass(slots=True, frozen=True)
 class AutoCompactionStartEvent:
-    reason: Literal["threshold", "overflow", "idle"]
-    action: Literal["context-full", "handoff"]
+    reason: Literal["threshold", "overflow", "idle", "incomplete"]
+    action: Literal["context-full", "handoff", "shake", "snapcompact"]
     type: Literal["auto_compaction_start"] = "auto_compaction_start"
 
 
 @dataclass(slots=True, frozen=True)
 class AutoCompactionEndEvent:
-    action: Literal["context-full", "handoff"]
+    action: Literal["context-full", "handoff", "shake", "snapcompact"]
     result: CompactionResult | None
     aborted: bool
     will_retry: bool
@@ -1047,9 +1162,50 @@ class TodoAutoClearEvent:
 
 
 @dataclass(slots=True, frozen=True)
+class PromptError:
+    """Failure detail of a `prompt_result` with `status == "error"`."""
+
+    message: str
+    retryable: bool
+    """The failure is transient: resubmitting later may succeed (omp's own retries are exhausted)."""
+    provider: str | None = None
+    model: str | None = None
+    http_status: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class PromptResultEvent:
+    """Outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`.
+
+    Emitted after the command's response, once the agent yielded. `agent_invoked`
+    is False when the prompt completed locally or failed before reaching the agent.
+    `session_settled` is False when queued messages or background jobs can still
+    wake the session; a `SessionSettledEvent` follows once they drain.
+    """
+
+    id: str | None
+    agent_invoked: bool
+    status: PromptStatus
+    error: PromptError | None = None
+    type: Literal["prompt_result"] = "prompt_result"
+    session_settled: bool = field(kw_only=True)
+
+
+@dataclass(slots=True, frozen=True)
+class SessionSettledEvent:
+    """The session went quiet: the last run yielded and no background work can wake it.
+
+    Distinct from a terminal `agent_end`, which only means one run yielded.
+    """
+
+    type: Literal["session_settled"] = "session_settled"
+
+
+@dataclass(slots=True, frozen=True)
 class UnknownNotification:
     payload: JsonObject
     type: Literal["unknown"] = "unknown"
+    parse_error: str | None = field(default=None, kw_only=True)
 
 
 RpcAgentEvent: TypeAlias = (
@@ -1078,6 +1234,8 @@ RpcNotification: TypeAlias = (
     ReadyEvent
     | ExtensionUiRequest
     | ExtensionError
+    | PromptResultEvent
+    | SessionSettledEvent
     | RpcAgentEvent
     | UnknownNotification
 )
@@ -1260,6 +1418,7 @@ def parse_todo_item(payload: JsonObject) -> TodoItem:
         ),
         notes=_optional_str(payload, "notes"),
         details=_optional_str(payload, "details"),
+        blocker=_optional_str(payload, "blocker"),
     )
 
 
@@ -1339,6 +1498,16 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         ),
         system_prompt=_optional_str_list(payload, "systemPrompt"),
         dump_tools=dump_tools,
+        fast_mode_enabled=bool(payload.get("fastModeEnabled", False)),
+        fast_mode_active=bool(payload.get("fastModeActive", False)),
+        tokens_per_second=_optional_float(payload, "tokensPerSecond"),
+        context_usage=parse_context_usage(
+            _optional_json_object(
+                payload.get("contextUsage"), field="sessionState.contextUsage"
+            )
+        ),
+        has_pending_async_work=bool(payload.get("hasPendingAsyncWork", False)),
+        is_settled=bool(payload.get("isSettled", False)),
     )
 
 
@@ -1353,6 +1522,13 @@ def parse_bash_result(payload: JsonObject) -> BashResult:
         output_lines=int(payload.get("outputLines", 0)),
         output_bytes=int(payload.get("outputBytes", 0)),
         artifact_id=_optional_str(payload, "artifactId"),
+    )
+
+
+def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
+    return FastModeResult(
+        enabled=_require_bool(payload, "enabled"),
+        active=_require_bool(payload, "active"),
     )
 
 
@@ -1394,6 +1570,15 @@ def parse_thinking_level_cycle_result(
 
 def parse_cancellation_result(payload: JsonObject | None) -> CancellationResult:
     return CancellationResult(cancelled=bool((payload or {}).get("cancelled", False)))
+
+
+def parse_open_session_result(payload: JsonObject) -> OpenSessionResult:
+    return OpenSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        resumed=_require_bool(payload, "resumed"),
+        session_id=_require_str(payload, "sessionId"),
+        session_file=_optional_str(payload, "sessionFile"),
+    )
 
 
 def parse_branch_result(payload: JsonObject | None) -> BranchResult:
@@ -1443,6 +1628,16 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     )
 
 
+def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
+    if payload is None:
+        return None
+    return ContextUsage(
+        tokens=int(payload.get("tokens", 0)),
+        context_window=int(payload.get("contextWindow", 0)),
+        percent=float(payload.get("percent", 0.0)),
+    )
+
+
 def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
     return ExtensionUiRequest(
         id=_require_str(payload, "id"),
@@ -1457,6 +1652,9 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         title=_optional_str(payload, "title"),
         options=_tuple_of_strings(
             payload.get("options"), field="extension_ui_request.options"
+        ),
+        option_details=_optional_json_objects(
+            payload.get("optionDetails"), field="extension_ui_request.optionDetails"
         ),
         message=_optional_str(payload, "message"),
         placeholder=_optional_str(payload, "placeholder"),
@@ -1487,6 +1685,9 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
             ),
         ),
         text=_optional_str(payload, "text"),
+        url=_optional_str(payload, "url"),
+        launch_url=_optional_str(payload, "launchUrl"),
+        instructions=_optional_str(payload, "instructions"),
     )
 
 
@@ -1495,6 +1696,36 @@ def parse_extension_error(payload: JsonObject) -> ExtensionError:
         extension_path=_require_str(payload, "extensionPath"),
         event=_require_str(payload, "event"),
         error=_require_str(payload, "error"),
+    )
+
+
+def parse_prompt_result(payload: JsonObject) -> PromptResultEvent:
+    error_payload = _optional_json_object(
+        payload.get("error"), field="prompt_result.error"
+    )
+    return PromptResultEvent(
+        id=_optional_str(payload, "id"),
+        agent_invoked=_require_bool(payload, "agentInvoked"),
+        status=cast(
+            PromptStatus,
+            _require_literal(
+                payload.get("status"),
+                _PROMPT_STATUS_VALUES,
+                field="prompt_result.status",
+            ),
+        ),
+        error=(
+            PromptError(
+                message=_require_str(error_payload, "message"),
+                retryable=_require_bool(error_payload, "retryable"),
+                provider=_optional_str(error_payload, "provider"),
+                model=_optional_str(error_payload, "model"),
+                http_status=_optional_int(error_payload, "httpStatus"),
+            )
+            if error_payload is not None
+            else None
+        ),
+        session_settled=_require_bool(payload, "sessionSettled"),
     )
 
 
@@ -1522,6 +1753,10 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "prompt_result":
+        return parse_prompt_result(payload)
+    if event_type == "session_settled":
+        return SessionSettledEvent()
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":
@@ -1530,6 +1765,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 cast(JsonValue | None, payload.get("messages"))
             ),
             message_count=_optional_int(payload, "messageCount"),
+            is_terminal=_optional_bool(payload, "isTerminal"),
+            yielded=_optional_bool(payload, "yielded"),
         )
     if event_type == "turn_start":
         return TurnStartEvent()
@@ -1554,7 +1791,8 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                     payload.get("message"), field="message_start.message"
                 ),
                 field="message_start.message",
-            )
+            ),
+            message_id=_optional_str(payload, "messageId"),
         )
     if event_type == "message_update":
         return MessageUpdateEvent(
@@ -1570,13 +1808,15 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                     field="message_update.assistantMessageEvent",
                 )
             ),
+            message_id=_optional_str(payload, "messageId"),
         )
     if event_type == "message_end":
         return MessageEndEvent(
             message=_parse_agent_message(
                 _clone_json_object(payload.get("message"), field="message_end.message"),
                 field="message_end.message",
-            )
+            ),
+            message_id=_optional_str(payload, "messageId"),
         )
     if event_type == "tool_execution_start":
         return ToolExecutionStartEvent(
@@ -1621,7 +1861,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
     if event_type == "auto_compaction_start":
         return AutoCompactionStartEvent(
             reason=cast(
-                Literal["threshold", "overflow", "idle"],
+                Literal["threshold", "overflow", "idle", "incomplete"],
                 _require_literal(
                     payload.get("reason", "threshold"),
                     _AUTO_COMPACTION_REASON_VALUES,
@@ -1629,7 +1869,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
                 ),
             ),
             action=cast(
-                Literal["context-full", "handoff"],
+                Literal["context-full", "handoff", "shake", "snapcompact"],
                 _require_literal(
                     payload.get("action", "context-full"),
                     _AUTO_COMPACTION_ACTION_VALUES,
@@ -1641,7 +1881,7 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
         result_payload = payload.get("result")
         return AutoCompactionEndEvent(
             action=cast(
-                Literal["context-full", "handoff"],
+                Literal["context-full", "handoff", "shake", "snapcompact"],
                 _require_literal(
                     payload.get("action", "context-full"),
                     _AUTO_COMPACTION_ACTION_VALUES,

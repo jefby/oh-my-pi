@@ -154,8 +154,9 @@ const agent = new Agent({
   // Dynamic model-scoped API key resolution (for expiring OAuth tokens)
   getApiKey: async (model) => tokenForModel(model),
 
-  // Tool execution context (late-bound UI/session access)
-  getToolContext: () => ({ /* app-defined */ }),
+  // Tool execution context (late-bound UI/session access). Surface the loop's
+  // passive-context sink so tools can call ctx.addAdditionalContext(...).
+  getToolContext: toolCall => ({ addAdditionalContext: toolCall?.addAdditionalContext /* app-defined */ }),
 });
 ```
 
@@ -279,17 +280,17 @@ const agent = new Agent({
 
 ## Tools
 
-Define tools using `AgentTool` with a Zod parameter schema (via `z` from `@oh-my-pi/pi-ai`).
+Define tools using `AgentTool` with an omptype parameter schema.
 
 ```typescript
-import { z } from "@oh-my-pi/pi-ai";
+import { type } from "@oh-my-pi/omptype";
 
 const readFileTool: AgentTool = {
 	name: "read_file",
 	label: "Read File", // For UI display
 	description: "Read a file's contents",
-	parameters: z.object({
-		path: z.string().describe("File path"),
+	parameters: type({
+		path: type("string").describe("File path"),
 	}),
 	execute: async (toolCallId, params, signal, onUpdate, context) => {
 		const content = await fs.readFile(params.path, "utf-8");

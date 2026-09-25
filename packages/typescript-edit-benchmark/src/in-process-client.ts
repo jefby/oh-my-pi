@@ -9,6 +9,7 @@ import type { AgentEvent, AgentMessage, ResolvedThinkingLevel, ThinkingLevel } f
 import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { AgentSession, AgentSessionEvent, AuthStorage, SessionStats } from "@oh-my-pi/pi-coding-agent";
 import {
+	AgentRegistry,
 	type CreateAgentSessionResult,
 	createAgentSession,
 	discoverAuthStorage,
@@ -49,23 +50,21 @@ export interface DiscoverSharedInfraOptions {
 
 /** Discover shared infrastructure once for the entire benchmark run. */
 export async function discoverSharedInfra(options: DiscoverSharedInfraOptions = {}): Promise<SharedInfra> {
-	const authStorage = await discoverAuthStorage();
+	// Initialize global Settings singleton (required by code paths that use the global `settings` proxy)
+	const overrides: Record<string, unknown> = {};
+	if (options.editVariant && options.editVariant !== "auto") {
+		overrides["edit.mode"] = options.editVariant;
+	}
+	if (options.editFuzzy !== undefined && options.editFuzzy !== "auto") {
+		overrides["edit.fuzzyMatch"] = options.editFuzzy;
+	}
+	if (options.editFuzzyThreshold !== undefined && options.editFuzzyThreshold !== "auto") {
+		overrides["edit.fuzzyThreshold"] = options.editFuzzyThreshold;
+	}
+	const settings = await Settings.init({ cwd: options.cwd, overrides });
+	const authStorage = await discoverAuthStorage(undefined, { settings });
 	try {
 		const modelRegistry = new ModelRegistry(authStorage);
-
-		// Initialize global Settings singleton (required by code paths that use the global `settings` proxy)
-		const overrides: Record<string, unknown> = {};
-		if (options.editVariant && options.editVariant !== "auto") {
-			overrides["edit.mode"] = options.editVariant;
-		}
-		if (options.editFuzzy !== undefined && options.editFuzzy !== "auto") {
-			overrides["edit.fuzzyMatch"] = options.editFuzzy;
-		}
-		if (options.editFuzzyThreshold !== undefined && options.editFuzzyThreshold !== "auto") {
-			overrides["edit.fuzzyThreshold"] = options.editFuzzyThreshold;
-		}
-		await Settings.init({ cwd: options.cwd, overrides });
-
 		return { authStorage, modelRegistry };
 	} catch (error) {
 		authStorage.close();
@@ -97,6 +96,11 @@ export class InProcessClient {
 			authStorage: shared?.authStorage,
 			modelRegistry: shared?.modelRegistry,
 			sessionManager: SessionManager.inMemory(this.#options.cwd),
+			// Benchmark tasks run many top-level sessions concurrently in one
+			// process. The global registry admits only one "Main" per process
+			// generation (later registrations replace earlier refs, which then
+			// fail session initialization), so each client gets its own registry.
+			agentRegistry: new AgentRegistry(),
 			systemPrompt: this.#options.appendSystemPrompt
 				? (defaultPrompt: string[]) => [...defaultPrompt, this.#options.appendSystemPrompt!]
 				: undefined,

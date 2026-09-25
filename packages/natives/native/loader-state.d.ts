@@ -26,6 +26,7 @@ export interface DetectCompiledBinaryInput {
 
 export function detectCompiledBinary(input: DetectCompiledBinaryInput): boolean;
 
+
 export interface GetAddonFilenamesInput {
 	tag: string;
 	arch: string;
@@ -55,12 +56,40 @@ export interface ResolveLoaderCandidatesInput {
 
 export function resolveLoaderCandidates(input: ResolveLoaderCandidatesInput): string[];
 
+export interface InitLoaderContextOverrides {
+	nativeDir?: string;
+	platform?: NodeJS.Platform | string;
+	isCompiledBinary?: boolean;
+	leafPackageDir?: string | null;
+}
+
+export interface NativeLoaderContext {
+	platformTag: string;
+	packageVersion: string;
+	nativeDir: string;
+	leafPackageDir: string | null;
+	versionedDir: string;
+	isCompiledBinary: boolean;
+	stageFromNodeModules: boolean;
+	selectedVariant: "modern" | "baseline" | null;
+	addonFilenames: string[];
+	addonLabel: string;
+	candidates: string[];
+	versionSentinelExport: string;
+	isWorkspaceLoad: boolean;
+	nativesDir: string;
+}
+
+export function initLoaderContext(overrides?: InitLoaderContextOverrides): NativeLoaderContext;
+
 export interface CleanupStaleNativeVersionsInput {
 	nativesDir: string;
 	currentVersion: string;
 }
 
 export function cleanupStaleNativeVersions(input: CleanupStaleNativeVersionsInput): string[];
+
+export function prepareNativeVersionDir(versionedDir: string): void;
 
 export interface ExtractEmbeddedAddonArchiveInput {
 	archivePath: string;
@@ -97,5 +126,34 @@ export function validateLoadedBindings(
 	bindings: Record<string, unknown>,
 	candidate: string,
 ): void;
+
+/** Identity of the addon `loadNative()` returned, for missing-export diagnostics. */
+export interface NativeAddonStatus {
+	/** Absolute path of the loaded `.node`. */
+	path: string;
+	/** Sentinel the loaded addon carries, or `null` before sentinels existed. */
+	sentinel: string | null;
+	/** Sentinel this loader's package version expects. */
+	expectedSentinel: string;
+	/** `package.json#version` of the loader that loaded it. */
+	packageVersion: string;
+	/** True when the addon carries a different release than this package. */
+	stale: boolean;
+}
+
+/** The addon behind this process's exports; `null` before a successful load. */
+export function nativeAddonStatus(): NativeAddonStatus | null;
+
+/**
+ * Stub for an export the addon does not provide: `undefined` on a current
+ * addon, a throwing function on a stale one.
+ */
+export function missingNativeExport(
+	symbolName: string,
+	addon?: NativeAddonStatus | null,
+): (() => never) | undefined;
+
+/** Actionable text for {@link missingNativeExport}. */
+export function missingNativeExportMessage(symbolName: string, addon?: NativeAddonStatus | null): string;
 
 export function loadNative(): Record<string, unknown>;

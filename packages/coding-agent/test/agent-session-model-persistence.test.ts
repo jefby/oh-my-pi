@@ -11,7 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession model persistence", () => {
@@ -28,7 +28,7 @@ describe("AgentSession model persistence", () => {
 	beforeAll(async () => {
 		sharedDir = TempDir.createSync("@pi-model-persistence-shared-");
 		sharedAuthStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
-		sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+		sharedAuthStorage.keys.setRuntime("anthropic", "test-key");
 		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
 	});
 
@@ -168,11 +168,19 @@ describe("AgentSession model persistence", () => {
 			initialModel: defaultModel,
 			modelRoles: { default: defaultRoleValue },
 		});
+		let modelChangedCount = 0;
+		created.session.subscribe(event => {
+			if (event.type === "model_changed") modelChangedCount++;
+		});
 
 		await created.session.setModel(nextModel);
 
 		expect(created.session.model?.id).toBe(nextModel.id);
 		expect(created.settings.getModelRole("default")).toBe(defaultRoleValue);
+		expect(modelChangedCount).toBe(1);
+
+		await created.session.setModel(nextModel);
+		expect(modelChangedCount).toBe(1);
 	});
 
 	it("persists the default role when explicitly requested", async () => {
@@ -201,12 +209,8 @@ describe("AgentSession model persistence", () => {
 
 		const targetWindow = nextModel.contextWindow ?? 0;
 		expect(targetWindow).toBeGreaterThan(0);
-		const overflowTokens = targetWindow + 1;
 
-		const result = await created.session.setModel(nextModel, "default", {
-			persist: true,
-			currentContextTokens: overflowTokens,
-		});
+		const result = await created.session.setModel(nextModel, "default", { persist: true });
 
 		expect(result).toEqual({ switched: true });
 		expect(created.session.model?.id).toBe(nextModel.id);

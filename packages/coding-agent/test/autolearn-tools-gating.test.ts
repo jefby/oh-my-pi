@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
-import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resetActiveSkillsForTests, type Skill, setActiveSkills } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
 import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -12,12 +13,8 @@ import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
-import { type } from "arktype";
 
-function makeSession(
-	settingsOverrides: Partial<Record<SettingPath, unknown>> = {},
-	extra: Partial<ToolSession> = {},
-): ToolSession {
+function makeSession(settingsOverrides: Record<string, unknown> = {}, extra: Partial<ToolSession> = {}): ToolSession {
 	return {
 		cwd: "/tmp/test",
 		hasUI: false,
@@ -71,7 +68,7 @@ describe("autolearn tool gating", () => {
 		expect(noBackend).not.toContain("learn");
 	});
 
-	it("excludes the tools from a subagent even with an explicit list", async () => {
+	it("excludes the tools from a subagent when not in the explicit list", async () => {
 		// taskDepth > 0: the controller never runs here, so a subagent's explicit
 		// whitelist must not be silently widened with write-capable tools.
 		const sub = (
@@ -88,6 +85,18 @@ describe("autolearn tool gating", () => {
 		).map(t => t.name);
 		expect(subDiscovered).not.toContain("manage_skill");
 		expect(subDiscovered).not.toContain("learn");
+	});
+
+	it("allows the tools in a subagent when explicitly requested in toolNames", async () => {
+		// Frontmatter tools: list overrides the taskDepth gate.
+		const sub = (
+			await createTools(makeSession({ "autolearn.enabled": true, "memory.backend": "mnemopi" }, { taskDepth: 1 }), [
+				"manage_skill",
+				"learn",
+			])
+		).map(t => t.name);
+		expect(sub).toContain("manage_skill");
+		expect(sub).toContain("learn");
 	});
 
 	it("offers learn with the file-based local backend", async () => {
@@ -289,11 +298,13 @@ describe("learn execute", () => {
 		expect(queued).toEqual(["queued lesson"]);
 	});
 
-	it("fails the lesson and skips the skill when mnemopi returns no id", async () => {
+	it("fails the lesson with the write error and skips the skill when the mnemopi write fails", async () => {
 		const failingState = {
 			sessionId: "sess-2",
 			session: { sessionManager: { getCwd: () => "/tmp/work" } },
-			rememberScoped: () => undefined,
+			rememberScoped: () => {
+				throw new Error("database or disk is full");
+			},
 		};
 		const session = makeSession(
 			{ "autolearn.enabled": true, "memory.backend": "mnemopi" },
@@ -304,7 +315,7 @@ describe("learn execute", () => {
 				memory: "lesson",
 				skill: { action: "create", name: "should-not-exist", description: "d", body: "b" },
 			}),
-		).rejects.toThrow(/did not store/i);
+		).rejects.toThrow("Mnemopi did not store the lesson: database or disk is full");
 		// A failed lesson must not leave a minted skill behind.
 		expect(await Bun.file(path.join(getManagedSkillsDir(), "should-not-exist", "SKILL.md")).exists()).toBe(false);
 	});

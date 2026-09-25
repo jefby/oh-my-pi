@@ -46,10 +46,12 @@ describe("compaction prefers the current session model over modelRoles.default",
 			throw new Error("Expected bundled test models to exist");
 		}
 
-		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.strategy": "context-full" });
+		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.methodOrder": ["soft"] });
 		settings.setModelRole("default", `${defaultRoleModel.provider}/${defaultRoleModel.id}`);
 
+		const promptCacheKey = "inherited-parent-cache";
 		const agent = new Agent({
+			promptCacheKey,
 			initialState: {
 				model: currentModel,
 				systemPrompt: ["Test"],
@@ -61,8 +63,8 @@ describe("compaction prefers the current session model over modelRoles.default",
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 		// Both providers have credentials so an "auth failure" wouldn't be the
 		// reason a candidate is skipped — order alone must drive the choice.
-		authStorage.setRuntimeApiKey(currentModel.provider, "anthropic-token");
-		authStorage.setRuntimeApiKey(defaultRoleModel.provider, "openai-token");
+		authStorage.keys.setRuntime(currentModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(defaultRoleModel.provider, "openai-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		session = new AgentSession({
@@ -98,6 +100,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 		expect(compactSpy).toHaveBeenCalled();
 		const [, firstCandidate] = compactSpy.mock.calls[0]!;
 		expect(`${firstCandidate.provider}/${firstCandidate.id}`).toBe(`${currentModel.provider}/${currentModel.id}`);
+		expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
 	});
 
 	it("falls back when the authenticated Bedrock candidate cannot resolve AWS credentials", async () => {
@@ -107,7 +110,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			throw new Error("Expected bundled test models to exist");
 		}
 
-		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.strategy": "context-full" });
+		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.methodOrder": ["soft"] });
 		settings.setModelRole("smol", `${fallbackModel.provider}/${fallbackModel.id}`);
 
 		const agent = new Agent({
@@ -120,8 +123,8 @@ describe("compaction prefers the current session model over modelRoles.default",
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "bedrock-credentials");
-		authStorage.setRuntimeApiKey(fallbackModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(currentModel.provider, "bedrock-credentials");
+		authStorage.keys.setRuntime(fallbackModel.provider, "anthropic-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		session = new AgentSession({
@@ -192,14 +195,14 @@ describe("compaction prefers the current session model over modelRoles.default",
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "anthropic-token");
-		authStorage.setRuntimeApiKey(compactionModel.provider, "openai-token");
+		authStorage.keys.setRuntime(currentModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(compactionModel.provider, "openai-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.strategy": "context-full" }),
+			settings: Settings.isolated({ "compaction.keepRecentTokens": 1, "compaction.methodOrder": ["soft"] }),
 			modelRegistry,
 		});
 		session.subscribe(() => {});
@@ -263,8 +266,8 @@ describe("compaction prefers the current session model over modelRoles.default",
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "openai-token");
-		authStorage.setRuntimeApiKey(nonRemoteCompactionModel.provider, "anthropic-token");
+		authStorage.keys.setRuntime(currentModel.provider, "openai-token");
+		authStorage.keys.setRuntime(nonRemoteCompactionModel.provider, "anthropic-token");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 
 		session = new AgentSession({

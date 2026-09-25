@@ -1,16 +1,19 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import { LiveSessionController, type LiveTranscript } from "../../live/controller";
+import { LiveSessionController, type LiveSessionControllerOptions, type LiveTranscript } from "../../live/controller";
 import { LIVE_MODEL } from "../../live/protocol";
-import { LiveVisualizer } from "../../live/visualizer";
+import { LiveVisualizer } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import { vocalizer } from "../../tts/vocalizer";
-import type { AssistantMessageComponent } from "../components/assistant-message";
-import type { CustomEditor } from "../components/custom-editor";
-import { theme } from "../theme/theme";
+import type { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../types";
-import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
+import { createAssistantMessageComponent } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
+
+import { cfgLiveVoice } from "../../live/settings";
 
 const ANIMATION_INTERVAL_MS = 80;
+type LiveSessionFactory = (options: LiveSessionControllerOptions) => LiveSessionController;
 
 const LIVE_MESSAGE_USAGE: AssistantMessage["usage"] = {
 	input: 0,
@@ -27,6 +30,7 @@ function errorFrom(cause: unknown): Error {
 /** Owns the editor-replacing visualizer and realtime session lifecycle for `/live`. */
 export class LiveCommandController {
 	readonly #ctx: InteractiveModeContext;
+	readonly #createSession: LiveSessionFactory | undefined;
 
 	#session: LiveSessionController | undefined;
 	#settling: Promise<void> | undefined;
@@ -40,8 +44,9 @@ export class LiveCommandController {
 	#assistantTranscriptTurn = 0;
 	#assistantTranscriptStartedAt = 0;
 
-	constructor(ctx: InteractiveModeContext) {
+	constructor(ctx: InteractiveModeContext, createSession?: LiveSessionFactory) {
 		this.#ctx = ctx;
+		this.#createSession = createSession;
 	}
 
 	/** Whether a live session is connected, connecting, or closing. */
@@ -96,13 +101,14 @@ export class LiveCommandController {
 				void this.stop().catch(cause => this.#ctx.showError(errorFrom(cause).message));
 			},
 			onToggleMute: () => this.#session?.toggleMute(),
+			stopKeys: this.#ctx.keybindings.getKeys("app.live.toggle"),
 		});
 		this.#mountVisualizer(visualizer);
 
-		let session: LiveSessionController;
-		session = new LiveSessionController({
+		const options: LiveSessionControllerOptions = {
 			session: this.#ctx.session,
 			extractAssistantText: message => this.#ctx.extractAssistantText(message),
+			voice: cfgLiveVoice.get(this.#ctx.settings),
 			callbacks: {
 				onPhase: phase => {
 					if (this.#visualizer !== visualizer) return;
@@ -128,7 +134,8 @@ export class LiveCommandController {
 				},
 				onTerminal: error => this.#finish(session, error),
 			},
-		});
+		};
+		const session = this.#createSession ? this.#createSession(options) : new LiveSessionController(options);
 		this.#session = session;
 
 		try {

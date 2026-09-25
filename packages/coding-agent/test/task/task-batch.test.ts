@@ -22,8 +22,12 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { isRecord } from "@oh-my-pi/pi-utils";
+
+import { cfgTaskEnableEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -38,6 +42,7 @@ function createSession(
 		settings?: Record<string, unknown>;
 		agentId?: string;
 		planMode?: boolean;
+		spawns?: string;
 	} = {},
 ): ToolSession {
 	return {
@@ -45,7 +50,7 @@ function createSession(
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
 		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
+		getSessionSpawns: () => options.spawns ?? "*",
 		getAgentId: () => options.agentId ?? null,
 		getPlanModeState: options.planMode ? () => ({ enabled: true }) : undefined,
 		asyncJobManager: options.manager,
@@ -53,8 +58,14 @@ function createSession(
 }
 
 function getSchemaProperties(tool: TaskTool): Record<string, unknown> {
-	const wire = toolWireSchema(tool) as { properties?: Record<string, unknown> };
-	return wire.properties ?? {};
+	const properties = toolWireSchema(tool).properties;
+	return isRecord(properties) ? properties : {};
+}
+
+function getBatchItemProperties(tool: TaskTool): Record<string, unknown> {
+	const tasks = getSchemaProperties(tool).tasks;
+	if (!isRecord(tasks) || !isRecord(tasks.items) || !isRecord(tasks.items.properties)) return {};
+	return tasks.items.properties;
 }
 
 function getFirstText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -116,42 +127,52 @@ describe("task.batch schema gating", () => {
 		expect(onProperties.agent).toBeUndefined();
 		expect(onProperties.outputSchema).toBeUndefined();
 		expect(onProperties.schemaMode).toBeUndefined();
-		const items = (onProperties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		expect(items?.properties?.task).toBeDefined();
-		expect(items?.properties?.name).toBeDefined();
-		expect(items?.properties?.agent).toBeDefined();
-		expect(items?.properties?.outputSchema).toBeDefined();
-		expect(typeof items?.properties?.outputSchema).toBe("object");
-		expect(items?.properties?.schemaMode).toBeDefined();
+		const itemProperties = getBatchItemProperties(on);
+		expect(itemProperties.task).toBeDefined();
+		expect(itemProperties.name).toBeDefined();
+		expect(itemProperties.agent).toBeDefined();
+		expect(itemProperties.outputSchema).toBeDefined();
+		expect(typeof itemProperties.outputSchema).toBe("object");
+		expect(itemProperties.schemaMode).toBeDefined();
 	});
 
-	it("keeps isolation boolean-only and describes the configured apply behavior", async () => {
+	it("hides effort by default and exposes it when task.enableEffort is enabled", async () => {
+		mockDiscovery();
+
+		const flatSession = createSession({ settings: { "task.batch": false } });
+		const flat = await TaskTool.create(flatSession);
+		expect(getSchemaProperties(flat).effort).toBeUndefined();
+		expect(flat.description).not.toContain("`effort`");
+
+		cfgTaskEnableEffort.override(flatSession.settings, true);
+		expect(getSchemaProperties(flat).effort).toBeDefined();
+		expect(flat.description).toContain("`effort`");
+
+		const batchSession = createSession({ settings: { "task.batch": true } });
+		const batch = await TaskTool.create(batchSession);
+		expect(getBatchItemProperties(batch).effort).toBeUndefined();
+		expect(batch.description).not.toContain("`effort`");
+
+		cfgTaskEnableEffort.override(batchSession.settings, true);
+		expect(getBatchItemProperties(batch).effort).toBeDefined();
+		expect(batch.description).toContain("`effort`");
+	});
+
+	it("keeps isolation boolean-only in the batch item schema", async () => {
 		mockDiscovery();
 
 		const tool = await TaskTool.create(
-			createSession({ settings: { "task.batch": true, "task.isolation.mode": "auto" } }),
+			createSession({ settings: { "task.batch": true, "task.isolation.enabled": true } }),
 		);
 		const properties = getSchemaProperties(tool);
 		expect(properties.isolated).toBeUndefined();
-		const items = (properties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		const isolatedSchema = items?.properties?.isolated;
+		const itemProperties = getBatchItemProperties(tool);
+		const isolatedSchema = itemProperties.isolated;
 		if (!isolatedSchema || typeof isolatedSchema !== "object" || !("type" in isolatedSchema)) {
 			throw new Error("Expected isolated to be a boolean schema");
 		}
 		expect(isolatedSchema.type).toBe("boolean");
-		expect(items?.properties?.apply).toBeUndefined();
-		expect(tool.description).toContain("automatically applied to the parent checkout");
-
-		const captureTool = await TaskTool.create(
-			createSession({
-				settings: {
-					"task.batch": true,
-					"task.isolation.mode": "auto",
-					"task.isolation.apply": false,
-				},
-			}),
-		);
-		expect(captureTool.description).toContain("without modifying the parent checkout");
+		expect(itemProperties.apply).toBeUndefined();
 	});
 
 	it("hides isolation from the dynamic batch schema in plan mode", async () => {
@@ -159,12 +180,11 @@ describe("task.batch schema gating", () => {
 		const tool = await TaskTool.create(
 			createSession({
 				planMode: true,
-				settings: { "task.batch": true, "task.isolation.mode": "auto" },
+				settings: { "task.batch": true, "task.isolation.enabled": true },
 			}),
 		);
-		const properties = getSchemaProperties(tool);
-		const items = (properties.tasks as { items?: { properties?: Record<string, unknown> } }).items;
-		expect(items?.properties?.isolated).toBeUndefined();
+		const itemProperties = getBatchItemProperties(tool);
+		expect(itemProperties.isolated).toBeUndefined();
 		expect(tool.description).not.toContain("`isolated`");
 	});
 
@@ -566,6 +586,27 @@ describe("task.batch spawning", () => {
 			"# Goal\nShared synchronous context.",
 			"# Goal\nShared synchronous context.",
 		]);
+	});
+
+	it("keeps a long result inline when no readable output artifact exists", async () => {
+		mockDiscovery();
+		const fullOutput = `REPORT:${"x".repeat(6_000)}:END`;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", {
+				output: fullOutput,
+				outputMeta: { lineCount: 1, charCount: fullOutput.length },
+			}),
+		);
+
+		const tool = await TaskTool.create(createSession({ settings: { "async.enabled": false, "task.batch": false } }));
+		const result = await tool.execute("tc-missing-artifact", {
+			name: "MissingArtifact",
+			task: "Return a long report.",
+		} as TaskParams);
+		const text = getFirstText(result);
+
+		expect(text).not.toContain("agent://MissingArtifact");
+		expect(text).toContain(":END");
 	});
 
 	it("settles the batch async aggregate when a queued spawn is cancelled mid-flight", async () => {

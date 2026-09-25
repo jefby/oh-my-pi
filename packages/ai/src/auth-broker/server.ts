@@ -9,8 +9,9 @@
  * Transport security is delegated to the operator (Tailscale / Wireguard);
  * the server only checks a bearer token against an allow-list per request.
  */
+
+import { type Type, type } from "@oh-my-pi/omptype";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type Type, type } from "arktype";
 import type { AuthStorage, StoredCredentialBlock } from "../auth-storage";
 import { parseBind } from "../utils/parse-bind";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
@@ -22,6 +23,7 @@ import type {
 	CredentialDisableResponse,
 	CredentialRefreshResponse,
 	CredentialUploadResponse,
+	DisabledCredentialsResponse,
 	HealthzResponse,
 	RefresherSchedule,
 	SnapshotEntry,
@@ -31,6 +33,8 @@ import type {
 	SnapshotStreamSnapshotEvent,
 } from "./types";
 import {
+	AUTH_BROKER_CAPABILITIES_HEADER,
+	AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES,
 	DEFAULT_AUTH_BROKER_BIND,
 	DEFAULT_REFRESH_INTERVAL_MS,
 	DEFAULT_REFRESH_SKEW_MS,
@@ -43,6 +47,8 @@ import {
 	credentialDisableRequestSchema,
 	credentialUploadRequestSchema,
 } from "./wire-schemas";
+
+const DEFAULT_EXTERNAL_CHANGE_POLL_MS = 250;
 
 export interface AuthBrokerServerOptions {
 	/** Underlying credential storage (wraps the local SQLite store on the broker). */
@@ -65,6 +71,11 @@ export interface AuthBrokerServerOptions {
 	 * without long sleeps. Default {@link DEFAULT_STREAM_KEEPALIVE_MS}.
 	 */
 	streamKeepaliveMs?: number;
+	/**
+	 * Override cross-process SQLite change polling in milliseconds.
+	 * Internal-only — tests use a short interval. Default 250ms.
+	 */
+	externalChangePollMs?: number;
 }
 
 export interface AuthBrokerServerHandle {
@@ -78,7 +89,7 @@ export interface AuthBrokerServerHandle {
 function json(status: number, body: unknown, headers?: Record<string, string>): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { "Content-Type": "application/json", ...(headers ?? {}) },
+		headers: { "Content-Type": "application/json", ...headers },
 	});
 }
 
@@ -93,6 +104,15 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	const match = header.match(/^Bearer\s+(.+)$/i);
 	if (!match) return false;
 	return tokens.has(match[1].trim());
+}
+
+function supportsCodexMeterBlockScopes(req: Request): boolean {
+	const capabilities = req.headers.get(AUTH_BROKER_CAPABILITIES_HEADER);
+	return (
+		capabilities
+			?.split(",")
+			.some(capability => capability.trim() === AUTH_BROKER_CAPABILITY_CODEX_METER_BLOCK_SCOPES) ?? false
+	);
 }
 
 /**
@@ -139,6 +159,7 @@ function snapshotHeaders(generation: number): Record<string, string> {
 	return {
 		ETag: `"${generation}"`,
 		"Cache-Control": "no-store",
+		Vary: AUTH_BROKER_CAPABILITIES_HEADER,
 	};
 }
 
@@ -175,15 +196,22 @@ function delayResult(ms: number): { promise: Promise<"timeout">; cancel: () => v
 class GenerationGate {
 	readonly #storage: AuthStorage;
 	readonly #unsubscribe: () => void;
+	readonly #pollTimer: NodeJS.Timeout;
+	#pollInFlight = false;
 	#waiters: Map<number, Set<() => void>> = new Map();
 
-	constructor(storage: AuthStorage) {
+	constructor(storage: AuthStorage, pollIntervalMs: number) {
 		this.#storage = storage;
-		this.#unsubscribe = storage.onGenerationChanged(generation => this.#wake(generation));
+		this.#unsubscribe = storage.credentials.onGeneration(generation => this.#wake(generation));
+		this.#pollTimer = setInterval(() => {
+			void this.#pollExternalChanges();
+		}, pollIntervalMs);
+		this.#pollTimer.unref?.();
+		void this.#pollExternalChanges();
 	}
 
 	waitForChange(afterGeneration: number, signal: AbortSignal): Promise<"changed" | "aborted"> {
-		if (this.#storage.getGeneration() !== afterGeneration) return Promise.resolve("changed");
+		if (this.#storage.credentials.generation !== afterGeneration) return Promise.resolve("changed");
 		if (signal.aborted) return Promise.resolve("aborted");
 
 		const done = Promise.withResolvers<"changed" | "aborted">();
@@ -211,6 +239,7 @@ class GenerationGate {
 	}
 
 	close(): void {
+		clearInterval(this.#pollTimer);
 		this.#unsubscribe();
 		for (const waiters of this.#waiters.values()) {
 			for (const resolve of waiters) resolve();
@@ -218,10 +247,22 @@ class GenerationGate {
 		this.#waiters.clear();
 	}
 
+	async #pollExternalChanges(): Promise<void> {
+		if (this.#pollInFlight) return;
+		this.#pollInFlight = true;
+		try {
+			await this.#storage.credentials.poll();
+		} catch (error) {
+			logger.debug("Auth broker external store change poll failed", { error: String(error) });
+		} finally {
+			this.#pollInFlight = false;
+		}
+	}
+
 	#wake(generation: number): void {
-		for (const [waitingFor, waiters] of [...this.#waiters]) {
+		for (const [waitingFor, waiters] of Array.from(this.#waiters)) {
 			if (generation <= waitingFor) continue;
-			for (const resolve of [...waiters]) resolve();
+			for (const resolve of Array.from(waiters)) resolve();
 		}
 	}
 }
@@ -281,9 +322,46 @@ function compareCredentialBlockSnapshots(a: CredentialBlockSnapshot, b: Credenti
 	return a.blockedUntilMs - b.blockedUntilMs;
 }
 
+const CODEX_BLOCK_PROVIDER_KEY = "openai-codex:oauth";
+const CODEX_LEGACY_PROJECTED_BLOCK_SCOPES = new Set(["chat", "spark", "shared"]);
+
+/**
+ * Older clients only consult the Codex `shared` scope. Keep SQLite canonical
+ * state meter-scoped, but conservatively collapse those scopes on their wire
+ * view so any active meter block remains visible to them.
+ */
+function projectCredentialBlocksForLegacyClient(blocks: readonly CredentialBlockSnapshot[]): CredentialBlockSnapshot[] {
+	const projected: CredentialBlockSnapshot[] = [];
+	let shared: CredentialBlockSnapshot | undefined;
+	for (const block of blocks) {
+		if (
+			block.providerKey !== CODEX_BLOCK_PROVIDER_KEY ||
+			!CODEX_LEGACY_PROJECTED_BLOCK_SCOPES.has(block.blockScope)
+		) {
+			projected.push(block);
+			continue;
+		}
+		const updatedAtMs =
+			block.updatedAtMs === undefined
+				? shared?.updatedAtMs
+				: shared?.updatedAtMs === undefined
+					? block.updatedAtMs
+					: Math.max(shared.updatedAtMs, block.updatedAtMs);
+		shared = {
+			providerKey: CODEX_BLOCK_PROVIDER_KEY,
+			blockScope: "shared",
+			blockedUntilMs: Math.max(shared?.blockedUntilMs ?? 0, block.blockedUntilMs),
+			...(updatedAtMs !== undefined ? { updatedAtMs } : {}),
+		};
+	}
+	if (shared) projected.push(shared);
+	return projected;
+}
+
 function buildCredentialBlockGroups(
 	blocks: readonly StoredCredentialBlock[],
 	serverNowMs: number,
+	clientSupportsCodexMeterBlockScopes: boolean,
 ): Map<number, CredentialBlockSnapshot[]> {
 	const byCredentialId = new Map<number, CredentialBlockSnapshot[]>();
 	for (const block of blocks) {
@@ -301,16 +379,30 @@ function buildCredentialBlockGroups(
 			byCredentialId.set(block.credentialId, [snapshotBlock]);
 		}
 	}
-	for (const credentialBlocks of byCredentialId.values()) credentialBlocks.sort(compareCredentialBlockSnapshots);
+	for (const [credentialId, credentialBlocks] of byCredentialId) {
+		const projected = clientSupportsCodexMeterBlockScopes
+			? credentialBlocks
+			: projectCredentialBlocksForLegacyClient(credentialBlocks);
+		projected.sort(compareCredentialBlockSnapshots);
+		byCredentialId.set(credentialId, projected);
+	}
 	return byCredentialId;
 }
 
-function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | undefined): SnapshotResponse {
+function buildSnapshot(
+	storage: AuthStorage,
+	refresher: AuthBrokerRefresher | undefined,
+	clientSupportsCodexMeterBlockScopes: boolean,
+): SnapshotResponse {
 	const serverNowMs = Date.now();
-	const base = storage.exportSnapshot();
+	const base = storage.credentials.snapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
 	const credentialIds = base.credentials.map(entry => entry.id);
-	const blocksByCredentialId = buildCredentialBlockGroups(storage.listCredentialBlocks(credentialIds), serverNowMs);
+	const blocksByCredentialId = buildCredentialBlockGroups(
+		storage.blocks.list(credentialIds),
+		serverNowMs,
+		clientSupportsCodexMeterBlockScopes,
+	);
 	const credentials: SnapshotEntry[] = base.credentials.map(entry => {
 		const blocks = blocksByCredentialId.get(entry.id);
 		const rotatesInMs = computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs);
@@ -333,13 +425,14 @@ async function serveSnapshot(
 	refresher: AuthBrokerRefresher | undefined,
 	peer: string,
 ): Promise<Response> {
-	await storage.reload();
-	let currentGeneration = storage.getGeneration();
+	await storage.credentials.reload();
+	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
+	let currentGeneration = storage.credentials.generation;
 	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -356,10 +449,10 @@ async function serveSnapshot(
 	waitController.abort();
 	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(currentGeneration));
 
-	await storage.reload();
-	currentGeneration = storage.getGeneration();
+	await storage.credentials.reload();
+	currentGeneration = storage.credentials.generation;
 	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -405,6 +498,7 @@ function serveSnapshotStream(
 ): Response {
 	const encoder = new TextEncoder();
 	const openedAt = Date.now();
+	const clientSupportsCodexMeterBlockScopes = supportsCodexMeterBlockScopes(req);
 	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
 	let unsubscribe: (() => void) | null = null;
@@ -460,9 +554,9 @@ function serveSnapshotStream(
 		try {
 			do {
 				pendingBumps = 0;
-				await storage.reload();
+				await storage.credentials.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher);
+				const snapshot = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -494,7 +588,7 @@ function serveSnapshotStream(
 						generation: snapshot.generation,
 					});
 				}
-				for (const id of [...lastByCredId.keys()]) {
+				for (const id of Array.from(lastByCredId.keys())) {
 					if (seenIds.has(id)) continue;
 					lastByCredId.delete(id);
 					const payload: SnapshotStreamRemovedEvent = {
@@ -516,8 +610,8 @@ function serveSnapshotStream(
 	const stream = new ReadableStream<Uint8Array>({
 		async start(c) {
 			controller = c;
-			await storage.reload();
-			const initial = buildSnapshot(storage, refresher);
+			await storage.credentials.reload();
+			const initial = buildSnapshot(storage, refresher, clientSupportsCodexMeterBlockScopes);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -526,7 +620,7 @@ function serveSnapshotStream(
 				write(": keepalive\n\n");
 			}, keepaliveMs);
 			keepaliveTimer.unref?.();
-			unsubscribe = storage.onGenerationChanged(() => {
+			unsubscribe = storage.credentials.onGeneration(() => {
 				void processGenerationBump();
 			});
 			abortHandler = (): void => cleanup();
@@ -545,6 +639,7 @@ function serveSnapshotStream(
 			"Cache-Control": "no-cache",
 			Connection: "keep-alive",
 			"X-Accel-Buffering": "no",
+			Vary: AUTH_BROKER_CAPABILITIES_HEADER,
 		},
 	});
 }
@@ -555,6 +650,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	const tokens = new Set<string>(opts.bearerTokens);
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
+	const externalChangePollMs = opts.externalChangePollMs ?? DEFAULT_EXTERNAL_CHANGE_POLL_MS;
 
 	const refresher = opts.disableRefresher
 		? undefined
@@ -564,7 +660,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				refreshIntervalMs: opts.refreshIntervalMs ?? DEFAULT_REFRESH_INTERVAL_MS,
 			});
 	refresher?.start();
-	const generationGate = new GenerationGate(opts.storage);
+	const generationGate = new GenerationGate(opts.storage, externalChangePollMs);
 
 	const server = Bun.serve({
 		hostname: bind.hostname,
@@ -597,7 +693,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						// last fetch instead of hitting provider endpoints repeatedly.
 						// `req.signal` propagates HTTP-client disconnects all the way to the
 						// per-caller cancel without touching the shared upstream fetch.
-						const reports = (await opts.storage.fetchUsageReports?.({ signal: req.signal })) ?? [];
+						const reports = (await opts.storage.usage.reports?.({ signal: req.signal })) ?? [];
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
 						// `metadata`.
@@ -616,7 +712,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const sinceMs =
 						sinceMsParsed !== undefined && Number.isFinite(sinceMsParsed) ? sinceMsParsed : undefined;
 					const provider = url.searchParams.get("provider") ?? undefined;
-					const entries = opts.storage.listUsageHistory({ sinceMs, provider });
+					const entries = opts.storage.usage.history({ sinceMs, provider });
 					logger.info("auth-broker usage history served", { peer, entries: entries.length, sinceMs, provider });
 					return json(200, { generatedAt: Date.now(), entries });
 				}
@@ -627,7 +723,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					// Array.prototype.entries; the schema already validated the shape.
 					const report = parsed.data as ClientUsageReportRequest;
 					try {
-						const recorded = opts.storage.recordClientUsage(report);
+						const recorded = opts.storage.usage.recordClient(report);
 						if (!recorded) return json(501, { error: "broker store does not persist client usage" });
 						logger.debug("auth-broker client usage recorded", {
 							peer,
@@ -645,12 +741,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (req.method === "GET" && pathname === "/v1/usage/clients") {
 					const sinceMsRaw = url.searchParams.get("sinceMs");
 					const sinceMsParsed = sinceMsRaw === null ? Number.NaN : Number.parseInt(sinceMsRaw, 10);
-					const summary = opts.storage.getClientUsageSummary(Number.isFinite(sinceMsParsed) ? sinceMsParsed : 0);
+					const summary = opts.storage.usage.clientSummary(Number.isFinite(sinceMsParsed) ? sinceMsParsed : 0);
 					return json(200, { generatedAt: Date.now(), clients: summary.clients });
 				}
 				if (req.method === "POST" && pathname === "/v1/usage/stale") {
 					try {
-						opts.storage.invalidateUsageCache?.();
+						await opts.storage.usage.invalidate?.();
 						logger.info("auth-broker usage cache invalidated", { peer });
 						return json(200, { ok: true });
 					} catch (error) {
@@ -659,11 +755,17 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						return json(500, { error: message });
 					}
 				}
+				if (req.method === "GET" && pathname === "/v1/credentials/disabled") {
+					const provider = url.searchParams.get("provider") ?? undefined;
+					const disabled = await opts.storage.credentials.listDisabled(provider, req.signal);
+					const body: DisabledCredentialsResponse = { generatedAt: Date.now(), disabled };
+					return json(200, body);
+				}
 				const refreshMatch = req.method === "POST" ? pathname.match(REFRESH_ROUTE) : null;
 				if (refreshMatch) {
 					const id = Number.parseInt(refreshMatch[1], 10);
 					try {
-						const entry = await opts.storage.refreshCredentialById(id, req.signal);
+						const entry = await opts.storage.oauth.refresh(id, req.signal);
 						const body: CredentialRefreshResponse = { entry };
 						logger.info("auth-broker credential refreshed", {
 							id,
@@ -682,11 +784,13 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				const disableMatch = req.method === "POST" ? pathname.match(DISABLE_ROUTE) : null;
 				if (disableMatch) {
 					const id = Number.parseInt(disableMatch[1], 10);
-					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
+					const parsed = await parseBody(req, credentialDisableRequestSchema, {
+						allowEmpty: true,
+					});
 					if (!parsed.ok) return parsed.response;
 					const cause =
 						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
-					const ok = opts.storage.disableCredentialById(id, cause);
+					const ok = await opts.storage.credentials.disable(id, cause);
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer, cause });
 						return json(404, { error: `No credential with id=${id}` });
@@ -706,12 +810,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						blockScope: parsed.data.blockScope,
 						blockedUntilMs: parsed.data.blockedUntilMs,
 					};
-					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
+					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
 						logger.info("auth-broker credential block miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
 					try {
-						opts.storage.upsertCredentialBlock(block);
+						opts.storage.blocks.upsert(block);
 						const response: CredentialBlockResponse = { ok: true };
 						logger.info("auth-broker credential block upserted", {
 							id,
@@ -731,12 +835,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				const blocksDeleteMatch = req.method === "DELETE" ? pathname.match(BLOCKS_ROUTE) : null;
 				if (blocksDeleteMatch) {
 					const id = Number.parseInt(blocksDeleteMatch[1], 10);
-					if (!opts.storage.exportSnapshot().credentials.some(entry => entry.id === id)) {
+					if (!opts.storage.credentials.snapshot().credentials.some(entry => entry.id === id)) {
 						logger.info("auth-broker credential blocks delete miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
 					try {
-						opts.storage.deleteCredentialBlocks(id);
+						opts.storage.blocks.deleteAll(id);
 						const response: CredentialBlocksDeleteResponse = { ok: true };
 						logger.info("auth-broker credential blocks deleted", { id, peer });
 						return json(200, response);
@@ -752,7 +856,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					if (!parsed.ok) return parsed.response;
 					const { provider, credential } = parsed.data;
 					try {
-						const entries = opts.storage.upsertCredential(provider, credential);
+						const entries = await opts.storage.credentials.upsert(provider, credential);
 						const identity =
 							credential.type === "oauth"
 								? (credential.email ?? credential.accountId ?? credential.projectId ?? "(no identity)")

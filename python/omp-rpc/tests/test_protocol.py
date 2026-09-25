@@ -4,7 +4,15 @@ import unittest
 
 from omp_rpc import (
     AgentEndEvent,
+    AutoCompactionEndEvent,
+    AutoCompactionStartEvent,
     ExtensionUiRequest,
+    MessageEndEvent,
+    MessageStartEvent,
+    MessageUpdateEvent,
+    PromptError,
+    PromptResultEvent,
+    SessionSettledEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -15,6 +23,116 @@ from omp_rpc import (
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_parse_message_update_preserves_assistant_event_type(self) -> None:
+        assistant = {"role": "assistant"}
+        common = {"contentIndex": 0, "partial": assistant}
+        cases = {
+            "start": {"partial": assistant},
+            "text_start": common,
+            "thinking_start": common,
+            "toolcall_start": common,
+            "text_delta": {**common, "delta": "text"},
+            "thinking_delta": {**common, "delta": "thought"},
+            "toolcall_delta": {**common, "delta": "arguments"},
+            "text_end": {**common, "content": "text"},
+            "thinking_end": {**common, "content": "thought"},
+            "toolcall_end": {**common, "toolCall": {}},
+            "done": {"reason": "stop", "message": assistant},
+            "error": {"reason": "error", "error": assistant},
+        }
+
+        for event_type, event in cases.items():
+            with self.subTest(event_type=event_type):
+                parsed = parse_notification(
+                    {
+                        "type": "message_update",
+                        "message": assistant,
+                        "assistantMessageEvent": {"type": event_type, **event},
+                    }
+                )
+
+                self.assertIsInstance(parsed, MessageUpdateEvent)
+                assert isinstance(parsed, MessageUpdateEvent)
+                self.assertEqual(parsed.assistant_message_event["type"], event_type)
+
+    def test_parse_message_lifecycle_events_carry_message_id(self) -> None:
+        assistant = {"role": "assistant"}
+        update = {
+            "type": "message_update",
+            "message": assistant,
+            "messageId": "m-7",
+            "assistantMessageEvent": {"type": "start", "partial": assistant},
+        }
+        events = [
+            parse_notification(
+                {"type": "message_start", "message": assistant, "messageId": "m-7"}
+            ),
+            parse_notification(update),
+            parse_notification(
+                {"type": "message_end", "message": assistant, "messageId": "m-7"}
+            ),
+        ]
+
+        self.assertIsInstance(events[0], MessageStartEvent)
+        self.assertIsInstance(events[2], MessageEndEvent)
+        self.assertEqual(
+            [getattr(event, "message_id") for event in events], ["m-7"] * 3
+        )
+        legacy = parse_notification({"type": "message_end", "message": assistant})
+        assert isinstance(legacy, MessageEndEvent)
+        self.assertIsNone(legacy.message_id)
+
+    def test_parse_prompt_result_with_error(self) -> None:
+        parsed = parse_notification(
+            {
+                "type": "prompt_result",
+                "id": "req_3",
+                "agentInvoked": True,
+                "sessionSettled": False,
+                "status": "error",
+                "error": {
+                    "message": "overloaded",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "httpStatus": 529,
+                    "retryable": True,
+                },
+            }
+        )
+
+        self.assertEqual(
+            parsed,
+            PromptResultEvent(
+                id="req_3",
+                agent_invoked=True,
+                status="error",
+                error=PromptError(
+                    message="overloaded",
+                    retryable=True,
+                    provider="anthropic",
+                    model="claude-sonnet-4-5",
+                    http_status=529,
+                ),
+                session_settled=False,
+            ),
+        )
+
+    def test_parse_session_settled_notification(self) -> None:
+        self.assertEqual(
+            parse_notification({"type": "session_settled"}), SessionSettledEvent()
+        )
+
+    def test_parse_prompt_result_rejects_unknown_status(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_notification(
+                {
+                    "type": "prompt_result",
+                    "agentInvoked": True,
+                    "sessionSettled": True,
+                    "status": "later",
+                }
+            )
+
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
             {
@@ -45,12 +163,17 @@ class ProtocolParsingTests(unittest.TestCase):
                 "thinkingLevel": "medium",
                 "isStreaming": False,
                 "isCompacting": False,
+                "hasPendingAsyncWork": True,
+                "isSettled": False,
                 "steeringMode": "one-at-a-time",
                 "followUpMode": "all",
                 "interruptMode": "immediate",
                 "sessionFile": "/tmp/test.jsonl",
                 "sessionId": "session-123",
                 "sessionName": "Scratchpad",
+                "fastModeEnabled": False,
+                "fastModeActive": True,
+                "tokensPerSecond": 12.5,
                 "autoCompactionEnabled": True,
                 "messageCount": 4,
                 "queuedMessageCount": 1,
@@ -76,6 +199,11 @@ class ProtocolParsingTests(unittest.TestCase):
                         "parameters": {"type": "object"},
                     }
                 ],
+                "contextUsage": {
+                    "tokens": 12345,
+                    "contextWindow": 200000,
+                    "percent": 6.1725,
+                },
             }
         )
 
@@ -87,6 +215,10 @@ class ProtocolParsingTests(unittest.TestCase):
         # Legacy bare-string systemPrompt is accepted and wrapped to a tuple.
         self.assertEqual(state.system_prompt, ("You are useful.",))
         self.assertEqual(state.dump_tools[0].name, "read")
+        assert state.context_usage is not None
+        self.assertEqual(state.context_usage.tokens, 12345)
+        self.assertEqual(state.context_usage.context_window, 200000)
+        self.assertEqual(state.context_usage.percent, 6.1725)
         assert state.model is not None and state.model.thinking is not None
         self.assertEqual(
             state.model.thinking.efforts, ("minimal", "low", "medium", "high")
@@ -95,6 +227,40 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertEqual(state.model.thinking.default_level, "medium")
         self.assertEqual(state.model.thinking.effort_map, {"high": "xhigh"})
         self.assertTrue(state.model.thinking.supports_display)
+        self.assertFalse(state.fast_mode_enabled)
+        self.assertTrue(state.fast_mode_active)
+        self.assertEqual(state.tokens_per_second, 12.5)
+        self.assertTrue(state.has_pending_async_work)
+        self.assertFalse(state.is_settled)
+
+    def test_parse_session_state_defaults_missing_fast_mode_and_throughput(
+        self,
+    ) -> None:
+        missing = object()
+        for tokens_per_second, expected in (
+            (None, None),
+            (missing, None),
+        ):
+            with self.subTest(tokens_per_second=tokens_per_second):
+                payload = {
+                    "sessionId": "session-123",
+                    "steeringMode": "one-at-a-time",
+                    "followUpMode": "all",
+                    "interruptMode": "immediate",
+                }
+                if tokens_per_second is not missing:
+                    payload["tokensPerSecond"] = tokens_per_second
+
+                state = parse_session_state(payload)
+
+                self.assertEqual(
+                    (
+                        state.fast_mode_enabled,
+                        state.fast_mode_active,
+                        state.tokens_per_second,
+                    ),
+                    (False, False, expected),
+                )
 
     def test_parse_agent_end_notification(self) -> None:
         notification = parse_notification(
@@ -126,16 +292,53 @@ class ProtocolParsingTests(unittest.TestCase):
                     }
                 ],
                 "messageCount": 1,
+                "isTerminal": False,
             }
         )
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(assistant_text(notification.messages[0]), "hello")
         self.assertEqual(notification.message_count, 1)
+        self.assertFalse(notification.is_terminal)
 
         legacy = AgentEndEvent(notification.messages, "agent_end")
         self.assertEqual(legacy.type, "agent_end")
         self.assertIsNone(legacy.message_count)
+        self.assertIsNone(legacy.is_terminal)
+
+    def test_parse_agent_end_yielded(self) -> None:
+        for raw, expected in ((True, True), (False, False), (None, None)):
+            with self.subTest(yielded=raw):
+                payload = {"type": "agent_end", "messages": [], "isTerminal": False}
+                if raw is not None:
+                    payload["yielded"] = raw
+                notification = parse_notification(payload)
+                assert isinstance(notification, AgentEndEvent)
+                self.assertEqual(notification.yielded, expected)
+
+    def test_parse_current_compaction_variants(self) -> None:
+        start = parse_notification(
+            {
+                "type": "auto_compaction_start",
+                "reason": "incomplete",
+                "action": "snapcompact",
+            }
+        )
+        end = parse_notification(
+            {
+                "type": "auto_compaction_end",
+                "action": "shake",
+                "result": None,
+                "aborted": False,
+                "willRetry": False,
+            }
+        )
+
+        self.assertIsInstance(start, AutoCompactionStartEvent)
+        self.assertEqual(start.reason, "incomplete")
+        self.assertEqual(start.action, "snapcompact")
+        self.assertIsInstance(end, AutoCompactionEndEvent)
+        self.assertEqual(end.action, "shake")
 
     def test_parse_extension_ui_request(self) -> None:
         notification = parse_notification(
@@ -156,6 +359,51 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertTrue(notification.requires_response())
         self.assertFalse(notification.is_passive())
 
+    def test_parse_select_option_details(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-2",
+                "method": "select",
+                "title": "Deploy",
+                "options": ["Keep", "Deploy"],
+                "optionDetails": [{}, {"description": "Push to production"}],
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.options, ("Keep", "Deploy"))
+        self.assertEqual(
+            notification.option_details,
+            ({}, {"description": "Push to production"}),
+        )
+
+    def test_extension_ui_request_preserves_positional_constructor(self) -> None:
+        request = ExtensionUiRequest(
+            "ui-legacy", "confirm", "Confirm", None, "Continue?"
+        )
+
+        self.assertEqual(request.message, "Continue?")
+        self.assertIsNone(request.option_details)
+
+    def test_parse_open_url_request(self) -> None:
+        notification = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ui-oauth",
+                "method": "open_url",
+                "url": "https://example.com/oauth",
+                "launchUrl": "http://127.0.0.1:8123/redirect",
+                "instructions": "Open this URL to continue.",
+            }
+        )
+
+        self.assertIsInstance(notification, ExtensionUiRequest)
+        self.assertEqual(notification.method, "open_url")
+        self.assertEqual(notification.url, "https://example.com/oauth")
+        self.assertEqual(notification.launch_url, "http://127.0.0.1:8123/redirect")
+        self.assertTrue(notification.is_passive())
+
     def test_parse_todo_reminder_notification(self) -> None:
         notification = parse_notification(
             {
@@ -175,6 +423,37 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsInstance(notification, TodoReminderEvent)
         self.assertEqual(notification.todos[0].content, "Map tools")
         self.assertEqual(notification.todos[0].status, "pending")
+
+    def test_parse_session_state_accepts_blocked_todo(self) -> None:
+        # Regression: the TS agent added a `blocked` todo status (with a
+        # `blocker` note); resuming a session whose todos were blocked must
+        # not fail state parsing.
+        state = parse_session_state(
+            {
+                "sessionId": "session-123",
+                "steeringMode": "one-at-a-time",
+                "followUpMode": "one-at-a-time",
+                "interruptMode": "immediate",
+                "todoPhases": [
+                    {
+                        "id": "phase-1",
+                        "name": "Fix",
+                        "tasks": [
+                            {
+                                "id": "task-1",
+                                "content": "Open PR",
+                                "status": "blocked",
+                                "blocker": "waiting on maintainer go-ahead",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        task = state.todo_phases[0].tasks[0]
+        self.assertEqual(task.status, "blocked")
+        self.assertEqual(task.blocker, "waiting on maintainer go-ahead")
 
     def test_assistant_text_excludes_thinking_by_default(self) -> None:
         message = {

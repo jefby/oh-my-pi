@@ -1,6 +1,6 @@
 # @oh-my-pi/pi-mnemopi
 
-Local SQLite memory engine for Oh My Pi agents.
+Local SQLite memory engine for omp agents.
 
 This package is the Bun/TypeScript port of the Mnemosyne memory engine. It provides:
 
@@ -72,7 +72,7 @@ const dynamicLlm = new Mnemopi({
 
 `Mnemopi` itself exposes banks directly through constructor options such as `bank`; it does not hard-code coding-agent project scoping.
 
-The Oh My Pi coding-agent wrapper adds `mnemopi.scoping` on top of those constructor options:
+The omp coding-agent wrapper adds `mnemopi.scoping` on top of those constructor options:
 
 - `global`: one shared bank
 - `per-project`: isolated project memory
@@ -83,6 +83,7 @@ In `per-project-tagged`, the wrapper is responsible for combining project-local 
 Common environment fallbacks:
 
 - `MNEMOPI_DATA_DIR` / `MNEMOPI_DB_PATH`: default storage location.
+- `MNEMOPI_DB_PAGE_SIZE`: optional SQLite page size for new file-backed databases; use a valid power of two from 512 to 65536 or `os` to request the detected system page size. Unset preserves SQLite's default.
 - `MNEMOPI_NO_EMBEDDINGS=1`: force FTS-only recall.
 - `MNEMOPI_EMBEDDING_MODEL`: defaults to `BAAI/bge-small-en-v1.5`.
 - `MNEMOPI_EMBEDDING_API_URL` and `MNEMOPI_EMBEDDING_API_KEY`: OpenAI-compatible embedding endpoint.

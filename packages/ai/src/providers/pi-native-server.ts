@@ -4,7 +4,7 @@
  * Where the OpenAI / Anthropic / Responses route modules translate foreign
  * wire shapes through pi-ai's canonical {@link Context}, this module accepts
  * the canonical shape *directly* — for clients that already speak pi-ai
- * (containerized omp, the swarm extension, robomp's sidecar auth-gateway).
+ * (containerized omp, robomp's sidecar auth-gateway).
  * Skipping the wire-format → Context → wire-format round-trip cuts
  * per-request CPU but, more importantly, avoids the quantization that those
  * translations impose on first-class pi-ai fields (service tier, cache
@@ -57,6 +57,7 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"maxTokens",
 	"cacheRetention",
 	"cachedContent",
+	"userProfileId",
 	"headers",
 	"initiatorOverride",
 	"maxRetryDelayMs",
@@ -69,15 +70,24 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"streamIdleTimeoutMs",
 	"reasoning",
 	"disableReasoning",
+	"forceReasoningOff",
 	"hideThinkingSummary",
 	"thinkingBudgets",
 	"toolChoice",
 	"serviceTier",
+	"guardrailIdentifier",
+	"guardrailVersion",
+	"guardrailTrace",
+	"requestMetadata",
 	"kimiApiFormat",
 	"syntheticApiFormat",
 	"preferWebsockets",
 	"openrouterVariant",
 	"loopGuard",
+	"acceptEmptyResponse",
+	// Anthropic on-demand compaction request: the gateway constructs the
+	// top-level `compaction` parameter, so the option must survive the hop.
+	"anthropicCompaction",
 ] as const satisfies readonly (keyof SimpleStreamOptions)[]);
 
 // ---------------------------------------------------------------------------

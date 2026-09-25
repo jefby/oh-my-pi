@@ -104,7 +104,7 @@ describe("GuestClient frame apply", () => {
 			vi.advanceTimersByTime(29_999);
 			expect(client.getSnapshot().phase).toBe("connecting");
 			client.applyFrameForTest(snapshotChunk([firstEntry], false));
-			expect(client.getSnapshot().entries).toEqual([firstEntry]);
+			expect(client.getSnapshot().entries).toEqual([]);
 			expect(client.getSnapshot().phase).toBe("connecting");
 
 			vi.advanceTimersByTime(29_999);
@@ -119,9 +119,72 @@ describe("GuestClient frame apply", () => {
 			completeClient.applyFrameForTest(snapshotChunk([firstEntry]));
 			vi.advanceTimersByTime(30_000);
 			expect(completeClient.getSnapshot().phase).toBe("live");
+			expect(completeClient.getSnapshot().entries).toEqual([firstEntry]);
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("keeps the transcript on screen through a resync and swaps it in on the final chunk", () => {
+		const e1 = messageEntry("e1", { role: "user", content: "hi", timestamp: 1 });
+		const e2 = messageEntry("e2", { role: "user", content: "again", timestamp: 2 });
+		const client = liveClient([e1]);
+
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(snapshotChunk([e1], false));
+		expect(client.getSnapshot().entries).toEqual([e1]);
+		expect(client.getSnapshot().loading).toEqual({ received: 1, total: 2 });
+
+		client.applyFrameForTest(snapshotChunk([e2]));
+		expect(client.getSnapshot().entries).toEqual([e1, e2]);
+		expect(client.getSnapshot().loading).toBeNull();
+		expect(client.getSnapshot().phase).toBe("live");
+	});
+
+	it("publishes live entries that arrive mid-snapshot after the snapshot, not inside it", () => {
+		const e1 = messageEntry("e1", { role: "user", content: "one", timestamp: 1 });
+		const e2 = messageEntry("e2", { role: "user", content: "two", timestamp: 2 });
+		const live = messageEntry("live", { role: "user", content: "live", timestamp: 3 });
+		const client = new GuestClient(LINK, "tester");
+
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(snapshotChunk([e1], false));
+		client.applyFrameForTest({ t: "entry", entry: live });
+		expect(client.getSnapshot().entries).toEqual([]);
+		expect(client.getSnapshot().loading).toEqual({ received: 1, total: 2 });
+
+		client.applyFrameForTest(snapshotChunk([e2]));
+		expect(client.getSnapshot().entries).toEqual([e1, e2, live]);
+	});
+
+	it("drops the finished stream ghost when its entry lands mid-snapshot", () => {
+		const e1 = messageEntry("e1", { role: "user", content: "one", timestamp: 1 });
+		const e2 = messageEntry("e2", { role: "user", content: "two", timestamp: 2 });
+		const message = assistantMessage("hello");
+		const client = new GuestClient(LINK, "tester");
+
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(snapshotChunk([e1], false));
+		client.applyFrameForTest({ t: "event", event: { type: "message_end", message } });
+		client.applyFrameForTest({ t: "entry", entry: messageEntry("a1", message) });
+		client.applyFrameForTest(snapshotChunk([e2]));
+
+		const snap = client.getSnapshot();
+		expect(snap.entries).toEqual([e1, e2, messageEntry("a1", message)]);
+		expect(snap.stream).toBeNull();
+		expect(snap.streamDone).toBe(false);
+	});
+
+	it("completes the snapshot once every promised entry arrived, even without a final chunk", () => {
+		const e1 = messageEntry("e1", { role: "user", content: "one", timestamp: 1 });
+		const e2 = messageEntry("e2", { role: "user", content: "two", timestamp: 2 });
+		const client = new GuestClient(LINK, "tester");
+
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(snapshotChunk([e1, e2], false));
+		expect(client.getSnapshot().phase).toBe("live");
+		expect(client.getSnapshot().entries).toEqual([e1, e2]);
+		expect(client.getSnapshot().loading).toBeNull();
 	});
 
 	it("message_update sets the stream ghost (synthesizing a missed start)", () => {
@@ -192,6 +255,34 @@ describe("GuestClient frame apply", () => {
 		client.applyFrameForTest({ t: "state", state: { ...STATE, isStreaming: false } });
 		expect(client.getSnapshot().working).toBe(false);
 	});
+	it("a state frame recovers a stuck-idle guest when agent_start was dropped", () => {
+		// The host begins streaming mid-turn, but the matching `agent_start`
+		// never arrived (e.g. dropped on a reconnect). Before the fix nothing
+		// set `working` true except `agent_start`, so the guest stayed idle.
+		const client = liveClient();
+		expect(client.getSnapshot().working).toBe(false);
+		client.applyFrameForTest({ t: "state", state: { ...STATE, isStreaming: true } });
+		expect(client.getSnapshot().working).toBe(true);
+	});
+
+	it("an idle state frame clears a pinned tool card when tool_execution_end was dropped", () => {
+		// Host reports idle, but the matching `tool_execution_end` was dropped,
+		// leaving a stuck tool card. The authoritative idle signal must clear it.
+		const client = liveClient();
+		client.applyFrameForTest({
+			t: "event",
+			event: {
+				type: "tool_execution_start",
+				toolCallId: "tc1",
+				toolName: "bash",
+				args: { command: "ls" },
+				intent: "Listing",
+			},
+		});
+		expect(client.getSnapshot().activeTools.size).toBe(1);
+		client.applyFrameForTest({ t: "state", state: { ...STATE, isStreaming: false } });
+		expect(client.getSnapshot().activeTools.size).toBe(0);
+	});
 
 	it("bus progress frames update the progress map", () => {
 		const client = liveClient();
@@ -232,6 +323,17 @@ describe("GuestClient frame apply", () => {
 		const notices = client.getSnapshot().notices;
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toMatchObject({ level: "error", message: "boom" });
+	});
+
+	it("auto_retry_end failure surfaces an error notice", () => {
+		const client = liveClient();
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "auto_retry_end", success: false, attempt: 3, finalError: "x" },
+		});
+		const notices = client.getSnapshot().notices;
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toMatchObject({ level: "error", message: "x" });
 	});
 
 	it("a pre-welcome error (hello rejection, e.g. protocol mismatch) ends the session with the host's reason", () => {
@@ -305,6 +407,26 @@ describe("GuestClient frame apply", () => {
 		const after = client.getSnapshot();
 		expect(after).not.toBe(before);
 		expect(after.agents).not.toBe(before.agents);
+		// Non-entry frames must not invalidate entry identity: Transcript's
+		// memo and useSyncExternalStore skip their O(n) scans per token.
 		expect(after.entries).toBe(before.entries);
+	});
+
+	it("replaces the entries reference when entry frames arrive", () => {
+		const client = liveClient();
+		const before = client.getSnapshot();
+		client.applyFrameForTest({
+			t: "entry",
+			entry: {
+				type: "message",
+				id: "m-new",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:02Z",
+				message: { role: "user", content: "hi", timestamp: 2 },
+			},
+		});
+		const after = client.getSnapshot();
+		expect(after.entries).not.toBe(before.entries);
+		expect(after.entries).toHaveLength(before.entries.length + 1);
 	});
 });

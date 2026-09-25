@@ -3,33 +3,50 @@
  */
 
 import { describe, expect, it, spyOn } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { buildOpenAiNativeHistory } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Context, Message, TextContent } from "@oh-my-pi/pi-ai";
+import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
+import type {
+	ResponseFileSearchToolCall,
+	ResponseFunctionWebSearch,
+	ResponseInputItem,
+	ResponseToolSearchOutputItemParam,
+} from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
+import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { isJsonSchemaValueValid } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	builtinCredentialSecretEntries,
+	collectEnvSecrets,
 	getExistingSecretPlaceholderKey,
 	getSecretPlaceholderKey,
+	getSecretPlaceholderKeySync,
 	loadSecrets,
 } from "@oh-my-pi/pi-coding-agent/secrets";
 import {
+	collectNativeReplayRegexSecretValues,
 	deobfuscateAgentMessages,
-	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	obfuscateMessages,
+	obfuscateNativeReplay,
 	obfuscateProviderContext,
 	obfuscateToolArguments,
-	type SecretEntry,
-	SecretObfuscator,
+} from "@oh-my-pi/pi-coding-agent/secrets/message-transform";
+import { type SecretEntry, SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
+import {
 	sanitizeSecretFriendlyName,
 	secretEntriesNeedPlaceholderKey,
 	secretEntryNeedsPlaceholderKey,
 	stripPendingSecretPlaceholderSuffix,
-} from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
+} from "@oh-my-pi/pi-coding-agent/secrets/placeholder";
 import { compileSecretRegex } from "@oh-my-pi/pi-coding-agent/secrets/regex";
 import { getActiveProfile, getAgentDir, setProfile } from "@oh-my-pi/pi-utils/dirs";
-import { type } from "arktype";
 
 describe("compileSecretRegex", () => {
 	it("adds global flag when not provided", () => {
@@ -49,6 +66,246 @@ describe("compileSecretRegex", () => {
 	});
 	it("rejects invalid regex flags", () => {
 		expect(() => compileSecretRegex("x", "zz")).toThrow();
+	});
+});
+
+describe("builtinCredentialSecretEntries", () => {
+	// Issue #6968: an unconfigured credential-shaped token in a tool result used
+	// to fall through to pi-ai's irreversible `[*_token_redacted]` rewrite, so an
+	// edit-tool `old_string` echoing that placeholder could never match the file.
+	// The contract: the token is hidden from provider-visible text AND restored
+	// byte-exact in tool-call arguments before tool execution.
+	it("hides unconfigured credential-shaped tokens and restores them in tool-call arguments", () => {
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries());
+		expect(obfuscator.hasSecrets()).toBe(true);
+
+		const tokens = [`sk-${"a1B-c2D".repeat(7)}e3F`, `ghp_${"aB1".repeat(12)}`, `glpat-${"xY2-".repeat(5)}`];
+		for (const token of tokens) {
+			const fileLine = `MOONSHOT_API_KEY=${token}`;
+			const providerView = obfuscator.obfuscate(fileLine);
+			expect(providerView).not.toContain(token);
+			// Re-obfuscation is a fixed point: the placeholder itself is never re-matched.
+			expect(obfuscator.obfuscate(providerView)).toBe(providerView);
+			// The model echoes the placeholder into edit-tool old_string verbatim.
+			const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+			expect(args.old_string).toBe(fileLine);
+		}
+	});
+
+	it("hides vendor-prefixed credentials across built-in families and restores them in tool-call arguments", () => {
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries());
+		const awsKey = `AKIA${"Z9".repeat(8)}`;
+		const googleKey = `AIza${"xQ9_".repeat(8)}abc`;
+		const slackToken = `xoxb-${"1a2B".repeat(6)}`;
+		const npmToken = `npm_${"Cd34".repeat(9)}`;
+		const stripeKey = `sk_live_${"Ef56".repeat(6)}`;
+		const stripeWebhook = `whsec_${"Gh78".repeat(8)}`;
+		const hfToken = `hf_${"Ij90".repeat(8)}ab`;
+		const sendgridKey = `SG.${"K1".repeat(11)}.${"M2".repeat(21)}M`;
+		const jwt = `eyJ${"N3".repeat(10)}.eyJ${"O4".repeat(10)}.${"P5".repeat(13)}P`;
+		const lines = [
+			`aws_access_key_id = ${awsKey}`,
+			`google api key: ${googleKey}`,
+			`SLACK_BOT_TOKEN=${slackToken}`,
+			`//registry.npmjs.org/:_authToken=${npmToken}`,
+			`stripe secret: ${stripeKey}`,
+			`endpoint_secret = ${stripeWebhook}`,
+			`HF_TOKEN=${hfToken}`,
+			`SENDGRID_API_KEY=${sendgridKey}`,
+			`id_token: ${jwt}`,
+		];
+		const tokens = [awsKey, googleKey, slackToken, npmToken, stripeKey, stripeWebhook, hfToken, sendgridKey, jwt];
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			const token = tokens[i];
+			const providerView = obfuscator.obfuscate(line);
+			expect(providerView).not.toContain(token);
+			expect(obfuscator.obfuscate(providerView)).toBe(providerView);
+			const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+			expect(args.old_string).toBe(line);
+		}
+	});
+
+	it("replaces only the token after a Bearer prefix", () => {
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries());
+		const token = `${"Q7w".repeat(13)}Z`;
+		const input = `Authorization: Bearer ${token}`;
+
+		const providerView = obfuscator.obfuscate(input);
+
+		expect(providerView).toContain("Authorization: Bearer ");
+		expect(providerView).not.toContain(token);
+		const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+		expect(args.old_string).toBe(input);
+	});
+
+	it("hides a multi-line PEM private key block as a single placeholder", () => {
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries());
+		const dash = "-".repeat(5);
+		const bodyLine = "A".repeat(64);
+		const pem = `${dash}BEGIN RSA PRIVATE KEY${dash}\n${bodyLine}\n${bodyLine}\n${bodyLine}\n${dash}END RSA PRIVATE KEY${dash}`;
+		const input = `before line\n${pem}\nafter line`;
+
+		const providerView = obfuscator.obfuscate(input);
+
+		expect(providerView).not.toContain("BEGIN RSA PRIVATE KEY");
+		expect(providerView).not.toContain("END RSA PRIVATE KEY");
+		expect(providerView).not.toContain(bodyLine);
+		expect(providerView.match(/\$\$[^$]+\$\$/g)).toHaveLength(1);
+		expect(providerView.startsWith("before line\n")).toBe(true);
+		expect(providerView.endsWith("\nafter line")).toBe(true);
+		const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+		expect(args.old_string).toBe(input);
+	});
+
+	it("leaves publishable keys, identifiers, and plain hashes alone", () => {
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries());
+		const publishable = `pk_live_${"Ab12".repeat(6)}`;
+		const gitSha = "a1b2c3d4".repeat(5);
+		const input = [
+			`publishable = ${publishable}`,
+			"token = get_token_expiry_seconds()",
+			`commit ${gitSha}`,
+			"keyboard_shortcut_secret_value",
+		].join("\n");
+
+		expect(obfuscator.obfuscate(input)).toBe(input);
+	});
+});
+
+describe("collectEnvSecrets connection URLs", () => {
+	it("registers the password from a DSN env var that does not match secret-name patterns", () => {
+		const name = "OMP_TEST_CONNURL_DSN";
+		const scheme = "postgres";
+		const user = "app";
+		const pw = `pw${"0123456789ab".slice(0, 12)}`;
+		const host = "db.internal:5432";
+		const db = "shop";
+		const url = `${scheme}://${user}:${pw}@${host}/${db}`;
+		process.env[name] = url;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.type === "plain" && e.mode === "obfuscate" && e.content === pw)).toBe(true);
+			expect(entries.some(e => e.content === url)).toBe(false);
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it("registers both raw and decoded forms of a percent-encoded password", () => {
+		const name = "OMP_TEST_CONNURL_ENCODED";
+		const pwRaw = `p%40ss${"12345678"}%3Ax`;
+		const pwDecoded = decodeURIComponent(pwRaw);
+		const url = `postgres://app:${pwRaw}@db.internal:5432/shop`;
+		process.env[name] = url;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.content === pwRaw)).toBe(true);
+			expect(entries.some(e => e.content === pwDecoded)).toBe(true);
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it("registers the password from a userless connection URL", () => {
+		const name = "OMP_TEST_CONNURL_NOUSER";
+		const pw = `pw${"0123456789ab".slice(0, 12)}`;
+		const url = `redis://:${pw}@redis.internal:6379/0`;
+		process.env[name] = url;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.type === "plain" && e.mode === "obfuscate" && e.content === pw)).toBe(true);
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it("registers the full password when it contains an unescaped at sign", () => {
+		const name = "OMP_TEST_CONNURL_RAW_AT";
+		const pw = "passwrd1@correcthorse";
+		const url = `postgres://app:${pw}@db.internal/shop`;
+		process.env[name] = url;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.type === "plain" && e.mode === "obfuscate" && e.content === pw)).toBe(true);
+			expect(new SecretObfuscator(entries).obfuscate(url)).not.toContain("correcthorse");
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it("skips connection-URL passwords shorter than the minimum length", () => {
+		const name = "OMP_TEST_CONNURL_SHORT";
+		const url = "postgres://app:pw@db.internal:5432/shop";
+		process.env[name] = url;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.content === "pw")).toBe(false);
+		} finally {
+			delete process.env[name];
+		}
+	});
+
+	it("ignores non-URL values on non-secret variable names", () => {
+		const name = "OMP_TEST_CONNURL_PLAIN";
+		const value = "hello-world-value-123";
+		process.env[name] = value;
+		try {
+			const entries = collectEnvSecrets();
+			expect(entries.some(e => e.content === value)).toBe(false);
+		} finally {
+			delete process.env[name];
+		}
+	});
+});
+
+describe("lazy placeholder key", () => {
+	// The built-in credential entries match dynamically, so they must not force
+	// `secret-placeholder.key` creation for every secrets.enabled session: the
+	// key provider is only invoked when a credential-shaped token is actually
+	// obfuscated, and exactly once across the obfuscator's lifetime.
+	it("resolves the key provider only on the first real credential match", () => {
+		let resolutions = 0;
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries(), () => {
+			resolutions++;
+			return crypto.randomBytes(32).toString("base64url");
+		});
+		expect(resolutions).toBe(0);
+		obfuscator.obfuscate("MOONSHOT_API_KEY=huntsville");
+		expect(resolutions).toBe(0);
+
+		const token = `sk-${"a1B-c2D".repeat(7)}e3F`;
+		const providerView = obfuscator.obfuscate(`MOONSHOT_API_KEY=${token}`);
+		expect(resolutions).toBe(1);
+		expect(providerView).not.toContain(token);
+		obfuscator.obfuscate(`repeat: ${token}`);
+		expect(resolutions).toBe(1);
+		const args = deobfuscateToolArguments(obfuscator, { old_string: providerView });
+		expect(args.old_string).toBe(`MOONSHOT_API_KEY=${token}`);
+	});
+
+	it("redacts a lazily resolved key from the same input that triggers resolution", () => {
+		const key = "K".repeat(43);
+		const obfuscator = new SecretObfuscator(builtinCredentialSecretEntries(), () => key);
+		const token = `sk-${"a1B-c2D".repeat(7)}e3F`;
+
+		const providerView = obfuscator.obfuscate(`key=${key}\ncredential=${token}`);
+
+		expect(providerView).not.toContain(key);
+		expect(providerView).not.toContain(token);
+	});
+
+	it("getSecretPlaceholderKeySync creates the key file on demand and shares it with the async readers", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-lazy-placeholder-key-"));
+		try {
+			expect(await getExistingSecretPlaceholderKey(dir)).toBeUndefined();
+			const key = getSecretPlaceholderKeySync(dir);
+			expect(key).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			expect(await getExistingSecretPlaceholderKey(dir)).toBe(key);
+			expect(await getSecretPlaceholderKey(dir)).toBe(key);
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -182,6 +439,33 @@ describe("SecretObfuscator regex behavior", () => {
 		expect(obfuscated[1]).toBe(systemDeveloperMsg);
 	});
 
+	it("obfuscates file metadata on a replayed compaction payload but keeps the block verbatim", () => {
+		const secret = "SUPER_SECRET_TOKEN_12345";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const message: Message = {
+			role: "user",
+			content: "Prior model work available.",
+			timestamp: 1,
+			providerPayload: {
+				type: "anthropicCompaction",
+				provider: "anthropic",
+				content: "## Goal\nAudit the handlers.",
+				filesText: `<files>\n# /repo/\n${secret}.key (Read)\n</files>`,
+			},
+		};
+
+		const [obfuscated] = obfuscateMessages(obfuscator, [message]);
+		if (obfuscated?.role !== "user") throw new Error("expected user message");
+		const payload = obfuscated.providerPayload;
+		if (payload?.type !== "anthropicCompaction") throw new Error("expected compaction payload");
+		// The metadata takes the same boundary as the summary text...
+		expect(payload.filesText).not.toContain(secret);
+		expect(obfuscator.deobfuscate(payload.filesText ?? "")).toContain(secret);
+		// ...while the replayed block stays byte-identical to the API summary.
+		expect(payload.content).toBe("## Goal\nAudit the handlers.");
+		expect(obfuscated).not.toBe(message);
+	});
+
 	it("never rewrites inline image bytes", () => {
 		const secret = "SUPER_SECRET_TOKEN_12345";
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
@@ -313,7 +597,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const input = `use ${secret} now`;
 		const obfuscated = obfuscator.obfuscate(input);
 
-		expect(obfuscated).toMatch(/#GITHUBTOKEN_[A-Z0-9]+:L#/);
+		expect(obfuscated).toMatch(/\$\$GITHUBTOKEN_[A-Z0-9]+:L\$\$/);
 		expect(obfuscated).not.toContain(secret);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
@@ -335,7 +619,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const collidingObfuscated = collidingObfuscator.obfuscate(collidingSecret);
 
 		expect(collidingObfuscated).not.toMatch(/GITHUBPATABC123_/);
-		expect(collidingObfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(collidingObfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
 		expect(collidingObfuscator.deobfuscate(collidingObfuscated)).toBe(collidingSecret);
 
 		const distinctSecret = "github_pat_xyz789";
@@ -344,7 +628,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		]);
 		const distinctObfuscated = distinctObfuscator.obfuscate(distinctSecret);
 
-		expect(distinctObfuscated).toMatch(/^#GITHUBTOKEN_[A-Z0-9]+:L#$/);
+		expect(distinctObfuscated).toMatch(/^\$\$GITHUBTOKEN_[A-Z0-9]+:L\$\$$/);
 		expect(distinctObfuscator.deobfuscate(distinctObfuscated)).toBe(distinctSecret);
 	});
 
@@ -369,7 +653,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate(longSecret);
 
 		expect(obfuscated).not.toMatch(/GITHUBPAT/);
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(longSecret);
 	});
 
@@ -389,7 +673,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate(longSecret);
 
 		expect(obfuscated).not.toContain(leakedPrefix);
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(longSecret);
 	});
 
@@ -399,7 +683,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const input = `use ${secret} please`;
 		const obfuscated = obfuscator.obfuscate(input);
 
-		expect(obfuscated).toMatch(/#APIKEY_[A-Z0-9]+:L#/);
+		expect(obfuscated).toMatch(/\$\$APIKEY_[A-Z0-9]+:L\$\$/);
 		expect(obfuscated).not.toContain(secret);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
@@ -424,7 +708,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate(input);
 
 		expect(obfuscated).not.toMatch(/TOKABC123_/);
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]+:L# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]+:L\$\$ now$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
 
@@ -445,7 +729,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate(input);
 
 		expect(obfuscated).not.toMatch(/TOKABC123_/);
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]+:L# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]+:L\$\$ now$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
 
@@ -467,7 +751,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toContain("TOKABC123_");
 		expect(obfuscated).not.toContain("zeta_secret1");
 		expect(obfuscated).not.toContain("tok_abc123");
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}(?::[ULCM])?# and #[A-Z0-9]{4,}(?::[ULCM])?# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ and \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ now$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
 
@@ -492,7 +776,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toContain("TOKABC123_");
 		expect(obfuscated).not.toContain("zeta_secret1");
 		expect(obfuscated).not.toContain("tok_abc123");
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}(?::[ULCM])?# and #[A-Z0-9]{4,}(?::[ULCM])?# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ and \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ now$/);
 		// Deobfuscation restores the two obfuscate-mode (regex-discovered)
 		// placeholders to the values that were actually matched — the replace-
 		// produced `tok_abc123` and the raw `zeta_secret1` — but the one-way
@@ -522,7 +806,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toContain("TOKABC123_");
 		expect(obfuscated).not.toContain("zeta_secret1");
 		expect(obfuscated).not.toContain("tok_abc123");
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}(?::[ULCM])?# and #[A-Z0-9]{4,}(?::[ULCM])?# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ and \$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$ now$/);
 		// Deobfuscation restores the two obfuscate-mode (regex-discovered)
 		// placeholders to the values that were actually matched — the
 		// regex-replace-produced `tok_abc123` and the raw `zeta_secret1` — but
@@ -556,7 +840,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toContain("TOKABC123_");
 		expect(obfuscated).not.toContain("OTHERSECRET");
 		expect(obfuscated).not.toContain("tok_abc123");
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}:U# and #[A-Z0-9]{4,}:L# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]{4,}:U\$\$ and \$\$[A-Z0-9]{4,}:L\$\$ now$/);
 		// Deobfuscation restores the plain secret's placeholder to `OTHERSECRET`
 		// and the regex-discovered placeholder to the value actually matched
 		// (`tok_abc123`); the one-way regex replace mapping never restores `X`.
@@ -590,7 +874,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toContain("TOKABC123_");
 		expect(obfuscated).not.toContain("OTHERSECRET");
 		expect(obfuscated).not.toContain("tok_abc123");
-		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}:U# and #[A-Z0-9]{4,}:L# now$/);
+		expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]{4,}:U\$\$ and \$\$[A-Z0-9]{4,}:L\$\$ now$/);
 		// Deobfuscation restores the plain secret's placeholder to `OTHERSECRET`
 		// and the regex-discovered placeholder to the value actually matched
 		// (`tok_abc123`); the default `X` -> `Z` hop is one-way, so neither `X`
@@ -603,10 +887,10 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
-		const stalePlaceholder = "#TOKABC123_OLDHASH:L#";
+		const stalePlaceholder = "$$TOKABC123_OLDHASH:L$$";
 
 		expect(obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(stalePlaceholder, new Set(["tok_abc123"]))).toBe(
-			"#OLDHASH:L#",
+			"$$OLDHASH:L$$",
 		);
 	});
 	it("strips unsafe prefixes from overlapping historical placeholders", () => {
@@ -614,10 +898,10 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 			{ type: "regex", content: "tok_[a-z0-9]+" },
 		]);
-		const stalePlaceholders = "#FOOO#TOKABC123_OLDHASH:L#";
+		const stalePlaceholders = "$$FOOO$$$$TOKABC123_OLDHASH:L$$";
 
 		expect(obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(stalePlaceholders, new Set(["tok_abc123"]))).toBe(
-			"#FOOO#OLDHASH:L#",
+			"$$FOOO$$$$OLDHASH:L$$",
 		);
 	});
 
@@ -644,9 +928,9 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// Turn 1: tok_abc123 has not appeared anywhere yet, so "TOKABC123" is not
 		// a collision — the friendly prefix is applied and persisted into history.
 		const turn1 = obfuscator.obfuscate("use OTHERSECRET now");
-		expect(turn1).toMatch(/^use #TOKABC123_[A-Z0-9]+:U# now$/);
-		const oldPlaceholder = turn1.match(/#TOKABC123_[A-Z0-9]+:U#/)![0];
-		const bareAlias = oldPlaceholder.replace(/^#TOKABC123_/, "#");
+		expect(turn1).toMatch(/^use \$\$TOKABC123_[A-Z0-9]+:U\$\$ now$/);
+		const oldPlaceholder = turn1.match(/\$\$TOKABC123_[A-Z0-9]+:U\$\$/)![0];
+		const bareAlias = oldPlaceholder.replace(/^\$\$TOKABC123_/, "$$");
 
 		// Turn 2: the already-obfuscated turn-1 output re-enters as prior history
 		// alongside NEW text that reveals tok_abc123 — a regex-protected value that
@@ -677,7 +961,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const input = `${longSecret} ${prefixSecret}`;
 		const obfuscated = obfuscator.obfuscate(input);
 
-		expect(obfuscated).toMatch(/^#TOKEN_[A-Z0-9]+:L# #[A-Z0-9]+:U#$/);
+		expect(obfuscated).toMatch(/^\$\$TOKEN_[A-Z0-9]+:L\$\$ \$\$[A-Z0-9]+:U\$\$$/);
 		expect(obfuscated).not.toContain(longSecret);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
@@ -688,7 +972,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate(`value ${secret}`);
 
 		expect(obfuscated).not.toContain(secret);
-		expect(obfuscated).toMatch(/^value #[A-Z0-9]+:U#$/);
+		expect(obfuscated).toMatch(/^value \$\$[A-Z0-9]+:U\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(`value ${secret}`);
 	});
 
@@ -712,7 +996,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("api_key=abcdefghXYZ");
 
-		expect(obfuscated).toMatch(/^#APIKEY_[A-Z0-9]+:M#$/);
+		expect(obfuscated).toMatch(/^\$\$APIKEY_[A-Z0-9]+:M\$\$$/);
 		expect(obfuscated).not.toContain("abcdefgh");
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=abcdefghXYZ");
 	});
@@ -725,23 +1009,27 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("api_key=abcdefghXYZ");
 
-		expect(obfuscated).toMatch(/^#APIKEY_[A-Z0-9]+:M#$/);
+		expect(obfuscated).toMatch(/^\$\$APIKEY_[A-Z0-9]+:M\$\$$/);
 		expect(obfuscated).not.toContain("abcdefgh");
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=abcdefghXYZ");
 	});
 	it("obfuscates bounded regex remainders around prior placeholders", () => {
-		const obfuscator = new SecretObfuscator([
-			{ type: "plain", content: "abcdefgh" },
-			{ type: "regex", content: "api_key=[A-Za-z0-9]{11}", friendlyName: "api-key" },
-		]);
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: "abcdefgh" },
+				{ type: "regex", content: "api_key=[A-Za-z0-9]{11}", friendlyName: "api-key" },
+			],
+			"collision-6422",
+		);
 		const token = obfuscator.obfuscate("abcdefgh");
+		expect(token).toContain("XYZ");
 
 		const obfuscated = obfuscator.obfuscate(`api_key=${token}XYZ`);
 
 		expect(obfuscated).not.toContain("api_key=");
-		expect(obfuscated).not.toContain("XYZ");
-		expect(obfuscated).toContain(token);
+		expect(obfuscated.replaceAll(token, "")).not.toContain("XYZ");
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=abcdefghXYZ");
+		expect(obfuscated).toContain(token);
 		expect(obfuscator.obfuscate(obfuscated)).toBe(obfuscated);
 	});
 
@@ -1323,7 +1611,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const key = "Q".repeat(43);
 		const discoveryObf = new SecretObfuscator([{ type: "plain", content: "ABCDEFGH" }], key);
 		const collidingPlaceholder = discoveryObf.obfuscate("ABCDEFGH");
-		expect(collidingPlaceholder).toMatch(/^#[A-Z0-9]+(?::[ULCM])?#$/);
+		expect(collidingPlaceholder).toMatch(/^\$\$[A-Z0-9]+(?::[ULCM])?\$\$$/);
 
 		for (const entries of [
 			[
@@ -1398,21 +1686,14 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(after.obfuscate(persisted)).toBe(persisted);
 	});
 
-	it("does not canonicalize literal placeholder aliases inside regex matches", () => {
-		const sharedKey = "F".repeat(43);
-		const plain = new SecretObfuscator([{ type: "plain", content: "legacy-secret" }], sharedKey);
-		expect(plain.deobfuscateStored("#XRRS#")).toBe("legacy-secret");
-
+	it("redacts literal hash-delimited text inside regex matches", () => {
 		const obfuscator = new SecretObfuscator(
-			[
-				{ type: "plain", content: "legacy-secret" },
-				{ type: "regex", content: "api_key=\\S+", friendlyName: "api-key" },
-			],
-			sharedKey,
+			[{ type: "regex", content: "api_key=\\S+", friendlyName: "api-key" }],
+			"F".repeat(43),
 		);
 
 		const obfuscated = obfuscator.obfuscate("api_key=#XRRS#");
-		expect(obfuscated).toMatch(/^#APIKEY_[A-Z0-9]+(?::[ULCM])?#$/);
+		expect(obfuscated).toMatch(/^\$\$APIKEY_[A-Z0-9]+(?::[ULCM])?\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=#XRRS#");
 	});
 
@@ -1427,7 +1708,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("SECRETUVX1");
 
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:U#REDACTED$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:U\$\$REDACTED$/);
 		expect(obfuscated).not.toMatch(/X1$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("SECRETUVREDACTED");
 	});
@@ -1446,7 +1727,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// The 8-char SECRETUVX1 redacts to one placeholder + REDACTED; assert the `X1`
 		// suffix is gone via end-anchored structure, not substring absence — the
 		// random keyed base can itself contain the two chars "X1".
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:U#REDACTED$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:U\$\$REDACTED$/);
 		expect(obfuscated).not.toMatch(/X1$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("SECRETUVREDACTED");
 	});
@@ -1466,7 +1747,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// it must not be duplicated on both sides of the preserved placeholder (the
 		// bug produced `REDACTED#…#REDACTED`). Asserted by structure plus an
 		// end-anchored guard rather than a base-collidable substring count.
-		expect(obfuscated).toMatch(/^REDACTED#[A-Z0-9]+:L#$/);
+		expect(obfuscated).toMatch(/^REDACTED\$\$[A-Z0-9]+:L\$\$$/);
 		expect(obfuscated).not.toMatch(/REDACTED$/);
 		expect(obfuscated).not.toContain("api_key=");
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("REDACTEDabcdefgh");
@@ -1485,7 +1766,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			"D".repeat(43),
 		);
 		const replaceOnce = replace.obfuscate("SECRETUVX1");
-		expect(replaceOnce).toMatch(/^#[A-Z0-9]+:U#REDACTED$/);
+		expect(replaceOnce).toMatch(/^\$\$[A-Z0-9]+:U\$\$REDACTED$/);
 		expect(replace.obfuscate(replaceOnce)).toBe(replaceOnce);
 		expect(replace.obfuscate(replace.obfuscate(replaceOnce))).toBe(replaceOnce);
 		expect(replace.deobfuscate(replaceOnce)).toBe("SECRETUVREDACTED");
@@ -1524,7 +1805,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			"G".repeat(43),
 		);
 		const token = obf.obfuscate("abcdefgh");
-		expect(token).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(token).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
 
 		// Input carries the prior token literally AND a fresh api_key=abcdefghXYZ (raw `abc`).
 		// The fresh occurrence must still be redacted (XYZ gone) while the prior token is
@@ -1622,7 +1903,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		);
 		const out = obf.obfuscate("XSECRETUVREDACTED");
 
-		expect(out).toMatch(/^REDACTED#[A-Z0-9]+:U#REDACTED$/);
+		expect(out).toMatch(/^REDACTED\$\$[A-Z0-9]+:U\$\$REDACTED$/);
 		expect(obf.obfuscate(out)).toBe(out);
 		expect(obf.deobfuscate(out)).toBe("REDACTEDSECRETUVREDACTED");
 	});
@@ -2069,7 +2350,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		);
 		const out = obf.obfuscate(`value=${secret}`);
 		expect(out).not.toContain(secret);
-		expect(out).not.toMatch(/#[A-Z0-9]/);
+		expect(out).not.toMatch(/\$\$[A-Z0-9]/);
 		// An unshadowed obfuscate entry still requires the key.
 		expect(secretEntriesNeedPlaceholderKey([{ type: "plain", content: secret, mode: "obfuscate" }])).toBe(true);
 		// A replace entry with DIFFERENT content does not shadow the obfuscate entry.
@@ -2088,7 +2369,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		];
 		expect(secretEntriesNeedPlaceholderKey(reintroEntries)).toBe(true);
 		const reintroOut = new SecretObfuscator(reintroEntries, "test-placeholder-key").obfuscate(`value=${secret}`);
-		expect(reintroOut).toMatch(/#[A-Z0-9]/);
+		expect(reintroOut).toMatch(/\$\$[A-Z0-9]/);
 		// Among duplicate same-content replace entries the LAST one wins (the
 		// obfuscator stores replace mappings in a content-keyed Map), so a safe earlier
 		// duplicate must not mask a later reintroducing one: key is still required.
@@ -2099,7 +2380,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		];
 		expect(secretEntriesNeedPlaceholderKey(dupReintroLast)).toBe(true);
 		expect(new SecretObfuscator(dupReintroLast, "test-placeholder-key").obfuscate(`value=${secret}`)).toMatch(
-			/#[A-Z0-9]/,
+			/\$\$[A-Z0-9]/,
 		);
 		// Reverse order: a later safe replacement overrides an earlier reintroducing
 		// one, so the obfuscate entry is shadowed and no key is needed.
@@ -2110,7 +2391,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		];
 		expect(secretEntriesNeedPlaceholderKey(dupSafeLast)).toBe(false);
 		expect(new SecretObfuscator(dupSafeLast, "test-placeholder-key").obfuscate(`value=${secret}`)).not.toMatch(
-			/#[A-Z0-9]/,
+			/\$\$[A-Z0-9]/,
 		);
 		// A transitive replace chain that rewrites a safe alias back into the secret
 		// (`SECRET -> ALIAS`, `ALIAS -> SECRET`) reintroduces the value before the
@@ -2123,7 +2404,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		];
 		expect(secretEntriesNeedPlaceholderKey(chainReintro)).toBe(true);
 		expect(new SecretObfuscator(chainReintro, "test-placeholder-key").obfuscate(`value=${secret}`)).toMatch(
-			/#[A-Z0-9]/,
+			/\$\$[A-Z0-9]/,
 		);
 		// A replacement fragment that joins with adjacent passthrough bytes to form an
 		// obfuscate content (`A -> SEC`, so `ARET12` becomes `SECRET12` during the
@@ -2135,7 +2416,9 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "A", mode: "replace", replacement: "SEC" },
 		];
 		expect(secretEntriesNeedPlaceholderKey(fragmentJoin)).toBe(true);
-		expect(new SecretObfuscator(fragmentJoin, "test-placeholder-key").obfuscate("x ARET12 y")).toMatch(/#[A-Z0-9]/);
+		expect(new SecretObfuscator(fragmentJoin, "test-placeholder-key").obfuscate("x ARET12 y")).toMatch(
+			/\$\$[A-Z0-9]/,
+		);
 		// A delete replacement also joins the passthrough bytes on both sides of the
 		// removed token, so it can reconstruct the obfuscate content even though its
 		// replacement output is empty.
@@ -2145,7 +2428,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "X", mode: "replace", replacement: "" },
 		];
 		expect(secretEntriesNeedPlaceholderKey(deleteJoin)).toBe(true);
-		expect(new SecretObfuscator(deleteJoin, "test-placeholder-key").obfuscate("SECRETX12")).toMatch(/#[A-Z0-9]/);
+		expect(new SecretObfuscator(deleteJoin, "test-placeholder-key").obfuscate("SECRETX12")).toMatch(/\$\$[A-Z0-9]/);
 	});
 
 	it("does not require the key when a later replacement erases a content-forming fragment", () => {
@@ -2165,7 +2448,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// placeholder, confirming the config is genuinely non-placeholding.
 		const out = new SecretObfuscator(entries, "test-placeholder-key").obfuscate("AARET12 and AART12");
 		expect(out).not.toContain("SECRET12");
-		expect(out).not.toMatch(/#[A-Z0-9]/);
+		expect(out).not.toMatch(/\$\$[A-Z0-9]/);
 	});
 
 	it("does not require the key when a later replacement erases the surrounding context bytes", () => {
@@ -2186,7 +2469,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(secretEntriesNeedPlaceholderKey(entries)).toBe(false);
 		const out = new SecretObfuscator(entries, "test-placeholder-key").obfuscate("AARET12 and SECRET12");
 		expect(out).not.toContain("SECRET12");
-		expect(out).not.toMatch(/#[A-Z0-9]/);
+		expect(out).not.toMatch(/\$\$[A-Z0-9]/);
 	});
 
 	it("redacts a raw sentinel-shaped suffix bridged into a match by a prior placeholder", () => {
@@ -2206,7 +2489,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 				"R".repeat(43),
 			);
 			const token = obf.obfuscate("SECRETUV");
-			expect(token).toMatch(/^#[A-Z0-9]+:U#$/);
+			expect(token).toMatch(/^\$\$[A-Z0-9]+:U\$\$$/);
 
 			const out = obf.obfuscate(`${token}ZZZZ`);
 
@@ -2300,7 +2583,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate("abcdefgh");
 
 		expect(obfuscated).not.toBe("REDACTED");
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("abcdefgh");
 	});
 
@@ -2312,8 +2595,8 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("abcdefgh");
 
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
-		expect(obfuscated).not.toMatch(/^#INNER_/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
+		expect(obfuscated).not.toMatch(/^\$\$INNER_/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("abcdefgh");
 	});
 
@@ -2325,8 +2608,8 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("secretuvX");
 
-		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#X$/);
-		expect(obfuscated).not.toMatch(/^#PARTIAL_/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]+:L\$\$X$/);
+		expect(obfuscated).not.toMatch(/^\$\$PARTIAL_/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("secretuvX");
 	});
 
@@ -2350,7 +2633,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			sharedKey,
 		);
 
-		expect(secondPlaceholder).toMatch(/^#OTHER_[A-Z0-9]+(?::[ULCM])?#$/);
+		expect(secondPlaceholder).toMatch(/^\$\$OTHER_[A-Z0-9]+(?::[ULCM])?\$\$$/);
 		expect(obfuscator.deobfuscate(secondPlaceholder)).toBe(firstPlaceholder);
 	});
 
@@ -2364,8 +2647,8 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "alpha-secret" },
 		]);
 
-		const firstToken = first.obfuscate("alpha-secret").match(/#[A-Z0-9]+:L#/)?.[0];
-		const secondToken = second.obfuscate("alpha-secret").match(/#[A-Z0-9]+:L#/)?.[0];
+		const firstToken = first.obfuscate("alpha-secret").match(/\$\$[A-Z0-9]+:L\$\$/)?.[0];
+		const secondToken = second.obfuscate("alpha-secret").match(/\$\$[A-Z0-9]+:L\$\$/)?.[0];
 
 		expect(firstToken).toBeDefined();
 		expect(firstToken).toBe(secondToken);
@@ -2373,60 +2656,12 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(first.deobfuscate(firstToken ?? "")).toBe("alpha-secret");
 	});
 
-	it("keeps legacy aliases aligned with formerly obfuscated secrets", () => {
-		const obfuscator = new SecretObfuscator([
-			{ type: "plain", content: "abc" },
-			{ type: "plain", content: "MYSECRET123" },
-		]);
-
-		expect(obfuscator.deobfuscateStored("#XRRS#")).toBe("MYSECRET123");
-		expect(obfuscator.deobfuscateStored("#NTJ5#")).toBe("#NTJ5#");
-	});
-
-	it("honors legacy index-derived aliases only on the stored-replay path", () => {
+	it("leaves hash-delimited tokens inert while restoring current placeholders", () => {
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: "legacy-secret" }]);
-
-		// The generated token is keyed, never the legacy index token.
-		expect(obfuscator.obfuscate("legacy-secret")).not.toBe("#XRRS#");
-
-		// Stored session replay/display restores pre-keyed legacy placeholders so
-		// older persisted sessions still resume correctly.
-		expect(obfuscator.deobfuscateStored("#XRRS#")).toBe("legacy-secret");
-
-		// Live provider output and tool-call arguments MUST NOT honor the legacy
-		// alias: it is unkeyed and trivially guessable, so a prompt-injected model
-		// could synthesize `#XRRS#` in a bash/read argument and exfiltrate the secret.
-		expect(obfuscator.deobfuscate("#XRRS#")).toBe("#XRRS#");
-		expect(obfuscator.deobfuscateObject({ cmd: "cat #XRRS#" })).toEqual({ cmd: "cat #XRRS#" });
-	});
-
-	it("restores keyed placeholders but never legacy aliases on agent-feeding replay", () => {
-		// deobfuscateSessionContext has two kinds of consumers: agent-feeding paths
-		// (resume, history rewrite, branch switch) whose output is re-obfuscated and
-		// sent to the provider, and a display-only transcript (allowLegacyAliases).
-		// Legacy index-derived `#XRRS#` aliases are unkeyed and guessable, so a
-		// prompt-injected model can plant one in ANY record it influences — its own
-		// assistant output OR a tool result (bash stdout). If a feed path restored
-		// it, the next provider turn would re-obfuscate it into a usable keyed
-		// placeholder the model could weaponize in a tool argument. So feed paths
-		// restore keyed placeholders ONLY; legacy is restored solely for the
-		// never-re-sent transcript so pre-keyed sessions still render their secrets.
-		const obfuscator = new SecretObfuscator([{ type: "plain", content: "legacy-secret" }]);
-		const keyedToken = obfuscator.obfuscate("legacy-secret");
-		expect(keyedToken).not.toContain("#XRRS#");
-
-		const assistant: Message = {
+		const current = obfuscator.obfuscate("legacy-secret");
+		const message: AgentMessage = {
 			role: "assistant",
-			content: [
-				{ type: "text", text: `attacker planted #XRRS# and echoed ${keyedToken}` },
-				{
-					type: "toolCall",
-					id: "call-1",
-					name: "read",
-					arguments: { note: keyedToken },
-					intent: `intent ${keyedToken}`,
-				},
-			],
+			content: [{ type: "text", text: `legacy #XRRS# current ${current}` }],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "test-model",
@@ -2441,89 +2676,20 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			stopReason: "stop",
 			timestamp: 1,
 		};
-		const toolResult: Message = {
-			role: "toolResult",
-			toolCallId: "call-1",
-			toolName: "bash",
-			content: [{ type: "text", text: "bash stdout #XRRS#" }],
-			isError: false,
-			timestamp: 2,
-		};
-		const branchSummary: AgentMessage = {
-			role: "branchSummary",
-			summary: `branch #XRRS# and echoed ${keyedToken}`,
-			fromId: "branch-1",
-			timestamp: 3,
-		};
-		const compactionSummary: AgentMessage = {
-			role: "compactionSummary",
-			summary: `compaction #XRRS# and echoed ${keyedToken}`,
-			tokensBefore: 0,
-			timestamp: 4,
-		};
-		const contextMessages: AgentMessage[] = [
-			assistant as AgentMessage,
-			toolResult as AgentMessage,
-			branchSummary,
-			compactionSummary,
-		];
-		const ctx = {
-			messages: contextMessages,
-			models: {},
-			injectedTtsrRules: [],
-			selectedMCPToolNames: [],
-			hasPersistedMCPToolSelection: false,
-			mode: "none",
-		};
 
-		// Agent-feeding default restores keyed placeholders authored by this
-		// obfuscator but leaves a prompt-injected legacy alias inert before the
-		// next provider turn.
-		const fed = deobfuscateSessionContext(ctx, obfuscator);
-		const fedAssistant = (fed.messages[0] as Extract<Message, { role: "assistant" }>).content[0] as { text: string };
-		const fedTool = (fed.messages[1] as Extract<Message, { role: "toolResult" }>).content[0] as { text: string };
-		expect(fedAssistant.text).toBe("attacker planted #XRRS# and echoed legacy-secret");
-		const fedCall = (fed.messages[0] as AssistantMessage).content[1] as {
-			arguments: Record<string, unknown>;
-			intent?: string;
-		};
-		expect(fedCall.arguments).toEqual({ note: "legacy-secret" });
-		expect(fedCall.intent).toBe("intent legacy-secret");
-		expect(fedTool.text).toBe("bash stdout #XRRS#");
-		const fedBranch = fed.messages[2] as Extract<AgentMessage, { role: "branchSummary" }>;
-		const fedCompaction = fed.messages[3] as Extract<AgentMessage, { role: "compactionSummary" }>;
-		expect(fedBranch.summary).toBe("branch #XRRS# and echoed legacy-secret");
-		expect(fedCompaction.summary).toBe("compaction #XRRS# and echoed legacy-secret");
-		const replayed = obfuscateMessages(obfuscator, [fed.messages[0] as Message]);
-		const replayedAssistant = replayed[0] as Extract<Message, { role: "assistant" }>;
-		const replayedText = replayedAssistant.content[0] as { text: string };
-		expect(replayedText.text).toBe(`attacker planted #XRRS# and echoed ${keyedToken}`);
-		const replayedCall = replayedAssistant.content[1] as { arguments: Record<string, unknown>; intent?: string };
-		expect(replayedCall.arguments).toEqual({ note: keyedToken });
-		expect(replayedCall.intent).toBe(`intent ${keyedToken}`);
-
-		// Display-only transcript: legacy aliases ARE restored so a genuinely
-		// pre-keyed session renders its secrets. This output is never re-obfuscated.
-		const shown = deobfuscateSessionContext(ctx, obfuscator, true);
-		const shownAssistant = (shown.messages[0] as Extract<Message, { role: "assistant" }>).content[0] as {
-			text: string;
-		};
-		const shownTool = (shown.messages[1] as Extract<Message, { role: "toolResult" }>).content[0] as { text: string };
-		expect(shownAssistant.text).toBe("attacker planted legacy-secret and echoed legacy-secret");
-		expect(shownTool.text).toBe("bash stdout #XRRS#");
-		const shownBranch = shown.messages[2] as Extract<AgentMessage, { role: "branchSummary" }>;
-		const shownCompaction = shown.messages[3] as Extract<AgentMessage, { role: "compactionSummary" }>;
-		expect(shownBranch.summary).toBe("branch legacy-secret and echoed legacy-secret");
-		expect(shownCompaction.summary).toBe("compaction legacy-secret and echoed legacy-secret");
+		const restored = deobfuscateAgentMessages(obfuscator, [message])[0];
+		if (restored?.role !== "assistant") throw new Error("expected restored assistant message");
+		const text = restored.content[0];
+		expect(text?.type === "text" && text.text).toBe("legacy #XRRS# current legacy-secret");
 	});
 
 	it("deobfuscates placeholders after friendlyName changes", () => {
 		const renamed = new SecretObfuscator([{ type: "plain", content: "renamed-secret", friendlyName: "new name" }]);
 		const current = renamed.obfuscate("renamed-secret");
-		const oldName = current.replace("#NEWNAME_", "#OLDNAME_");
+		const oldName = current.replace("$$NEWNAME_", () => "$$OLDNAME_");
 		const removedName = new SecretObfuscator([{ type: "plain", content: "renamed-secret" }]);
 
-		expect(current).toMatch(/^#NEWNAME_[A-Z0-9]+:L#$/);
+		expect(current).toMatch(/^\$\$NEWNAME_[A-Z0-9]+:L\$\$$/);
 		expect(renamed.deobfuscate(oldName)).toBe("renamed-secret");
 		expect(removedName.deobfuscate(oldName)).toBe("renamed-secret");
 	});
@@ -2537,13 +2703,12 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const [tokenA, tokenB] = obfuscated.split(" ");
 		if (!tokenA || !tokenB) throw new Error("expected two friendly placeholders");
 
-		expect(tokenA).toMatch(/^#ALPHA_[A-Z0-9]+:M#$/);
-		expect(tokenB).toMatch(/^#BRAVO_[A-Z0-9]+:M#$/);
+		expect(tokenA).toMatch(/^\$\$ALPHA_[A-Z0-9]+:M\$\$$/);
+		expect(tokenB).toMatch(/^\$\$BRAVO_[A-Z0-9]+:M\$\$$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("SeCretuv SecRetuv");
 
-		const stripPrefix = (token: string) => token.replace(/^#[A-Z0-9]+_/, "#");
-		const aliasA = stripPrefix(tokenA);
-		const aliasB = stripPrefix(tokenB);
+		const aliasA = tokenA.replace(/^\$\$[A-Z0-9]+_/, () => "$$");
+		const aliasB = tokenB.replace(/^\$\$[A-Z0-9]+_/, () => "$$");
 		expect(aliasA).not.toBe(aliasB);
 		expect(obfuscator.deobfuscate(aliasA)).toBe("SeCretuv");
 		expect(obfuscator.deobfuscate(aliasB)).toBe("SecRetuv");
@@ -2592,13 +2757,13 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// name-independent bare-alias suffix (`_<hash>:<hint>#`) that
 		// lookupFriendlyPlaceholderAlias also resolves on purpose for deobfuscate().
 		const bravoPlaceholder = obfuscator.obfuscate(secretB);
-		expect(bravoPlaceholder).toMatch(/^#BRAVO_[A-Z0-9]{4,}(?::[ULCM])?#$/);
-		const aliasSuffix = bravoPlaceholder.replace(/^#BRAVO/, "");
+		expect(bravoPlaceholder).toMatch(/^\$\$BRAVO_[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
+		const aliasSuffix = bravoPlaceholder.replace(/^\$\$BRAVO/, "");
 
 		// Forge a token shaped exactly like a friendly placeholder for secretB, but
 		// with secretA's raw literal value standing in for the friendly name.
-		const forgedExact = `#${secretA}${aliasSuffix}`;
-		expect(forgedExact).toMatch(/^#[A-Z0-9]+_[A-Z0-9]{4,}(?::[ULCM])?#$/);
+		const forgedExact = `$$${secretA}${aliasSuffix}`;
+		expect(forgedExact).toMatch(/^\$\$[A-Z0-9]+_[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
 		expect(obfuscator.obfuscate(forgedExact)).not.toContain(secretA);
 
 		// A prefix that merely CONTAINS secretA (not just equals it) must also be
@@ -2642,13 +2807,13 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// Learn secretB's real placeholder, then derive the friendly-name-
 		// independent bare-alias suffix (`_<hash>:<hint>#`).
 		const bravoPlaceholder = obfuscator.obfuscate(secretB);
-		expect(bravoPlaceholder).toMatch(/^#BRAVO_[A-Z0-9]{4,}(?::[ULCM])?#$/);
-		const aliasSuffix = bravoPlaceholder.replace(/^#BRAVO/, "");
+		expect(bravoPlaceholder).toMatch(/^\$\$BRAVO_[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
+		const aliasSuffix = bravoPlaceholder.replace(/^\$\$BRAVO/, "");
 
 		// Forge a token wrapping the REGEX secret's raw literal around secretB's
 		// real bare-alias suffix.
-		const forgedExact = `#${regexSecret}${aliasSuffix}`;
-		expect(forgedExact).toMatch(/^#[A-Z0-9]+_[A-Z0-9]{4,}(?::[ULCM])?#$/);
+		const forgedExact = `$$${regexSecret}${aliasSuffix}`;
+		expect(forgedExact).toMatch(/^\$\$[A-Z0-9]+_[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
 		expect(obfuscator.obfuscate(forgedExact)).not.toContain(regexSecret);
 
 		// Mixed real + forged in one call: the real secretB placeholder must still
@@ -2682,14 +2847,14 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		// registering `tokabc123` (not `TOKABC123`) in `#obfuscateMappings`.
 		const real = obf.obfuscate("use tokabc123 now");
 		expect(real).not.toContain("tokabc123");
-		const suffix = /#([A-Z0-9]{4,}(?::[ULCM])?)#/.exec(real)?.[1];
+		const suffix = /\$\$([A-Z0-9]{4,}(?::[ULCM])?)\$\$/.exec(real)?.[1];
 		expect(suffix).toBeDefined();
 
 		// Forge a token wrapping an UPPERCASE variant of the secret around the
 		// real bare-alias suffix — differently cased from what was actually
 		// discovered, so it cannot match either exact-string check, only the
 		// regex pattern itself.
-		const forged = `see #TOKABC123_${suffix}# here`;
+		const forged = `see $$TOKABC123_${suffix}$$ here`;
 		const out = obf.obfuscate(forged);
 		expect(out).not.toContain("TOKABC123");
 	});
@@ -2714,15 +2879,15 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
 
 		const real = obfuscator.obfuscate(secret);
-		const suffix = /#([A-Z0-9]{4,}(?::[ULCM])?)#/.exec(real)?.[1];
+		const suffix = /\$\$([A-Z0-9]{4,}(?::[ULCM])?)\$\$/.exec(real)?.[1];
 		expect(suffix).toBeDefined();
 
 		// Forge a prefix that is the sanitized rendering of the SAME configured
 		// secret's own value, wrapped around the real bare-alias suffix.
-		const forged = `run tool with #GITHUBPATABC123_${suffix}# now`;
+		const forged = `run tool with $$GITHUBPATABC123_${suffix}$$ now`;
 		const restored = obfuscator.deobfuscate(forged);
 		expect(restored).not.toContain(secret);
-		expect(restored).toContain("#GITHUBPATABC123_");
+		expect(restored).toContain("$$GITHUBPATABC123_");
 
 		// A genuine rename is unaffected: the OLD friendly-name prefix is not
 		// itself secret-shaped, so the bare-alias fallback still resolves it to
@@ -2731,9 +2896,9 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "some-other-secret-value", friendlyName: "OldName" },
 		]);
 		const currentToken = renameObfuscator.obfuscate("some-other-secret-value");
-		expect(currentToken).toMatch(/^#OLDNAME_[A-Z0-9]+:L#$/);
-		const renameSuffix = currentToken.replace(/^#OLDNAME/, "");
-		expect(renameObfuscator.deobfuscate(`#NEWNAME${renameSuffix}`)).toBe("some-other-secret-value");
+		expect(currentToken).toMatch(/^\$\$OLDNAME_[A-Z0-9]+:L\$\$$/);
+		const renameSuffix = currentToken.replace(/^\$\$OLDNAME/, "");
+		expect(renameObfuscator.deobfuscate(`$$NEWNAME${renameSuffix}`)).toBe("some-other-secret-value");
 	});
 
 	it("drops a friendly name that contains another configured secret's literal value", () => {
@@ -2758,11 +2923,11 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		const obfuscated = obfuscator.obfuscate("ABCDEFGH");
 		expect(obfuscated).not.toContain("LEAKTOKEN");
 		// Friendly name dropped for this mint: bare, unprefixed placeholder shape.
-		expect(obfuscated).toMatch(/^#[A-Z0-9]{4,}(?::[ULCM])?#$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
 
 		// A friendly name that does NOT collide with any live secret is unaffected.
 		const safeObfuscated = obfuscator.obfuscate("OTHERSECRETXY");
-		expect(safeObfuscated).toMatch(/^#SAFE_[A-Z0-9]{4,}(?::[ULCM])?#$/);
+		expect(safeObfuscated).toMatch(/^\$\$SAFE_[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
 	});
 
 	it("drops a friendly name matched by a later-declared regex secret, regardless of entries[] order", () => {
@@ -2783,14 +2948,14 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		const obfuscated = obfuscator.obfuscate("ABCDEFGH");
 		expect(obfuscated).not.toContain("LEAKTOKEN");
-		expect(obfuscated).toMatch(/^#[A-Z0-9]{4,}(?::[ULCM])?#$/);
+		expect(obfuscated).toMatch(/^\$\$[A-Z0-9]{4,}(?::[ULCM])?\$\$$/);
 	});
 
 	it("keeps a mixed-case placeholder stable when a same-normalized secret is added earlier", () => {
 		// Session 1: only SecRet is configured; persist its mixed-case token.
 		const before = new SecretObfuscator([{ type: "plain", content: "SecRetuv" }]);
 		const persisted = before.obfuscate("SecRetuv");
-		expect(persisted).toMatch(/^#[A-Z0-9]+:M#$/);
+		expect(persisted).toMatch(/^\$\$[A-Z0-9]+:M\$\$$/);
 
 		// Session 2: SeCret (same normalized value, also :M) is added EARLIER.
 		const after = new SecretObfuscator([
@@ -2880,18 +3045,23 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 	});
 
 	it("withholds pending placeholders while streaming provider text", () => {
-		expect(stripPendingSecretPlaceholderSuffix("before #")).toBe("before ");
-		expect(stripPendingSecretPlaceholderSuffix("before #AB12:")).toBe("before ");
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN")).toBe("before ");
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN_")).toBe("before ");
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN_AB12:")).toBe("before ");
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN_AB12:U")).toBe("before ");
-		// A lone trailing `#` is buffered even after an alnum/`:` because it can
-		// open a new placeholder; emitting it would corrupt the length-sliced draft.
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN_AB12:U#")).toBe("before #TOKEN_AB12:U");
-		expect(stripPendingSecretPlaceholderSuffix("prefix ID#")).toBe("prefix ID");
-		expect(stripPendingSecretPlaceholderSuffix("count 42#")).toBe("count 42");
-		expect(stripPendingSecretPlaceholderSuffix("before #TOKEN ")).toBe("before #TOKEN ");
+		expect(stripPendingSecretPlaceholderSuffix("before $")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$AB12:")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN_")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN_AB12:")).toBe("before ");
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN_AB12:U")).toBe("before ");
+		// A trailing delimiter character is buffered because it can open an adjacent placeholder.
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN_AB12:U$$")).toBe("before $$TOKEN_AB12:U");
+		expect(stripPendingSecretPlaceholderSuffix("prefix ID$")).toBe("prefix ID");
+		expect(stripPendingSecretPlaceholderSuffix("count 42$")).toBe("count 42");
+		expect(stripPendingSecretPlaceholderSuffix("before $$TOKEN ")).toBe("before $$TOKEN ");
+		// A single `$` followed by non-`$` can never open a `$$…$$` placeholder, so it
+		// must stream through instead of being withheld until the next boundary.
+		expect(stripPendingSecretPlaceholderSuffix("run $HOME")).toBe("run $HOME");
+		expect(stripPendingSecretPlaceholderSuffix("pay $100")).toBe("pay $100");
+		expect(stripPendingSecretPlaceholderSuffix("cost $$100")).toBe("cost ");
 	});
 
 	it("uses independent bases across casing variants with distinct hints", () => {
@@ -2901,17 +3071,17 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "Secretuv", friendlyName: "token" },
 		]);
 		const obfuscated = obfuscator.obfuscate("secretuv SECRETUV Secretuv");
-		const tokens = obfuscated.match(/#TOKEN_[A-Z0-9]+:[ULCM]#/g);
+		const tokens = obfuscated.match(/\$\$TOKEN_[A-Z0-9]+:[ULCM]\$\$/g);
 		if (!tokens) throw new Error("Expected case-hinted placeholders");
-		const bases = tokens.map(token => /^#TOKEN_([A-Z0-9]+):/.exec(token)?.[1]);
+		const bases = tokens.map(token => /^\$\$TOKEN_([A-Z0-9]+):/.exec(token)?.[1]);
 
 		expect(tokens).toHaveLength(3);
 		// Distinct ASCII-case variants must NOT share a base: a shared case-folded
 		// base would let a provider synthesize a sibling token by swapping the hint.
 		expect(new Set(bases).size).toBe(3);
-		expect(tokens[0]?.endsWith(":L#")).toBe(true);
-		expect(tokens[1]?.endsWith(":U#")).toBe(true);
-		expect(tokens[2]?.endsWith(":C#")).toBe(true);
+		expect(tokens[0]?.endsWith(":L$$")).toBe(true);
+		expect(tokens[1]?.endsWith(":U$$")).toBe(true);
+		expect(tokens[2]?.endsWith(":C$$")).toBe(true);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("secretuv SECRETUV Secretuv");
 	});
 
@@ -2931,18 +3101,18 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 		// Provider sees only the lowercase placeholder.
 		const visible = obfuscator.obfuscate("abc12345");
-		expect(visible).toMatch(/^#[A-Z0-9]+:L#$/);
-		const base = /^#([A-Z0-9]+):L#$/.exec(visible)?.[1];
+		expect(visible).toMatch(/^\$\$[A-Z0-9]+:L\$\$$/);
+		const base = /^\$\$([A-Z0-9]+):L\$\$$/.exec(visible)?.[1];
 		if (!base) throw new Error("expected a lowercase placeholder base");
 
 		// The uppercase secret's real token uses an independent base.
 		const upperReal = obfuscator.obfuscate("ABC12345");
-		expect(upperReal).toMatch(/^#[A-Z0-9]+:U#$/);
-		expect(upperReal).not.toBe(`#${base}:U#`);
+		expect(upperReal).toMatch(/^\$\$[A-Z0-9]+:U\$\$$/);
+		expect(upperReal).not.toBe(`$$${base}:U$$`);
 
 		// Live deobfuscation of the synthesized sibling token leaves it literal
 		// instead of restoring the never-provider-visible uppercase secret.
-		const synthesized = `#${base}:U#`;
+		const synthesized = `$$${base}:U$$`;
 		expect(obfuscator.deobfuscate(synthesized)).toBe(synthesized);
 		expect(obfuscator.deobfuscateObject({ cmd: synthesized })).toEqual({ cmd: synthesized });
 		// The legitimate visible token still round-trips.
@@ -2960,7 +3130,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		]);
 		const input = "SeCretuv SecRetuv";
 		const obfuscated = obfuscator.obfuscate(input);
-		const tokens = obfuscated.match(/#TOKEN_[A-Z0-9]+:M#/g);
+		const tokens = obfuscated.match(/\$\$TOKEN_[A-Z0-9]+:M\$\$/g);
 		if (!tokens) throw new Error("Expected mixed-case placeholders");
 
 		expect(tokens).toHaveLength(2);
@@ -2975,7 +3145,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			{ type: "plain", content: "second-token", friendlyName: "api" },
 		]);
 		const obfuscated = obfuscator.obfuscate("first-token second-token");
-		const tokens = obfuscated.match(/#API_[A-Z0-9]+:L#/g);
+		const tokens = obfuscated.match(/\$\$API_[A-Z0-9]+:L\$\$/g);
 		if (!tokens) throw new Error("Expected friendly-name placeholders");
 
 		expect(tokens).toHaveLength(2);
@@ -3009,7 +3179,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.friendlyName).toBeUndefined();
-			expect(obfuscated).toMatch(/#[A-Z0-9]+:L#/);
+			expect(obfuscated).toMatch(/\$\$[A-Z0-9]+:L\$\$/);
 			expect(obfuscated).not.toMatch(/_[A-Z0-9]+/);
 			expect(obfuscator.deobfuscate(obfuscated)).toBe("invalid-friendly-secret");
 		} finally {
@@ -3035,7 +3205,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 
 			expect(entries).toHaveLength(1);
 			expect(entries[0]?.friendlyName).toBeUndefined();
-			expect(obfuscated).toMatch(/#[A-Z0-9]+:L#/);
+			expect(obfuscated).toMatch(/\$\$[A-Z0-9]+:L\$\$/);
 			expect(obfuscated).not.toMatch(/_[A-Z0-9]+/);
 			expect(obfuscator.deobfuscate(obfuscated)).toBe("non-string-friendly-secret");
 		} finally {
@@ -3091,7 +3261,7 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			const obfuscated = obfuscator.obfuscate("use tok_abc123 now");
 
 			expect(obfuscated).not.toMatch(/TOKABC123_/);
-			expect(obfuscated).toMatch(/^use #[A-Z0-9]+:L# now$/);
+			expect(obfuscated).toMatch(/^use \$\$[A-Z0-9]+:L\$\$ now$/);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -3289,10 +3459,10 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		const minted = obfuscateMessages(obfuscator, [
 			{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 },
 		]);
-		const mintedMatch = /#TOKABC123_[A-Z0-9]+(?::[ULCM])?#/.exec(userText(minted[0]));
+		const mintedMatch = /\$\$TOKABC123_[A-Z0-9]+(?::[ULCM])?\$\$/.exec(userText(minted[0]));
 		if (mintedMatch === null) throw new Error("expected turn 1 to mint a friendly-prefixed placeholder");
 		const mintedPlaceholder = mintedMatch[0];
-		const bareAlias = mintedPlaceholder.replace(/^#TOKABC123_/, "#");
+		const bareAlias = mintedPlaceholder.replace(/^\$\$TOKABC123_/, "$$");
 
 		// Turn 2: assistant history persisted that exact prefixed placeholder
 		// verbatim, wrapped in ordinary prose that carries no secret material
@@ -3390,10 +3560,10 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		const minted = obfuscateMessages(obfuscator, [
 			{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 },
 		]);
-		const mintedMatch = /#TOKABC123_[A-Z0-9]+(?::[ULCM])?#/.exec(userText(minted[0]));
+		const mintedMatch = /\$\$TOKABC123_[A-Z0-9]+(?::[ULCM])?\$\$/.exec(userText(minted[0]));
 		if (mintedMatch === null) throw new Error("expected turn 1 to mint a friendly-prefixed placeholder");
 		const mintedPlaceholder = mintedMatch[0];
-		const bareAlias = mintedPlaceholder.replace(/^#TOKABC123_/, "#");
+		const bareAlias = mintedPlaceholder.replace(/^\$\$TOKABC123_/, "$$");
 
 		// Turn 2: assistant history persisted that exact prefixed placeholder
 		// verbatim inside a toolCall block's arguments, intent, and rawBlock —
@@ -3515,10 +3685,10 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		const minted = obfuscateMessages(obfuscator, [
 			{ role: "user", content: "remember OTHERSECRET for later", timestamp: 1 },
 		]);
-		const mintedMatch = /#TOKABC123_[A-Z0-9]+(?::[ULCM])?#/.exec(userText(minted[0]));
+		const mintedMatch = /\$\$TOKABC123_[A-Z0-9]+(?::[ULCM])?\$\$/.exec(userText(minted[0]));
 		if (mintedMatch === null) throw new Error("expected turn 1 to mint a friendly-prefixed placeholder");
 		const mintedPlaceholder = mintedMatch[0];
-		const bareAlias = mintedPlaceholder.replace(/^#TOKABC123_/, "#");
+		const bareAlias = mintedPlaceholder.replace(/^\$\$TOKABC123_/, "$$");
 
 		// Turn 2: assistant history persisted that exact prefixed placeholder
 		// verbatim inside a thinking block, wrapped in ordinary raw reasoning
@@ -3584,6 +3754,581 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 
 		// Fixed point: re-obfuscating the already-stripped batch changes nothing further.
 		expect(JSON.stringify(obfuscateMessages(obfuscator, result))).toEqual(serialized);
+	});
+});
+
+describe("native replay secret obfuscation", () => {
+	it("redacts dynamic discovery descriptions and schema examples without changing identifiers", () => {
+		const secret = "DISCOVERY_SECRET_123";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const schemaFor = (text: string) => ({
+			type: "object",
+			description: text,
+			required: ["description"],
+			properties: { description: { type: "array", items: { $ref: "#/$defs/value" }, examples: [[text]] } },
+			$defs: { value: { type: "string", title: text, $comment: text } },
+		});
+		const itemsFor = (text: string) => [
+			{
+				type: "mcp_list_tools",
+				id: secret,
+				server_label: secret,
+				tools: [
+					{
+						name: secret,
+						description: text,
+						input_schema: schemaFor(text),
+						annotations: { title: text, readOnlyHint: true },
+					},
+				],
+			} satisfies ResponseInputItem.McpListTools,
+			{
+				type: "tool_search_output",
+				id: secret,
+				call_id: secret,
+				execution: "client",
+				status: "completed",
+				tools: [
+					{
+						type: "namespace",
+						name: secret,
+						description: text,
+						tools: [
+							{ type: "function", name: secret, description: text, parameters: schemaFor(text), strict: true },
+							{
+								type: "custom",
+								name: secret,
+								description: text,
+								format: { type: "grammar", syntax: "regex", definition: secret },
+							},
+						],
+					},
+					{
+						type: "mcp",
+						server_label: secret,
+						server_description: text,
+						server_url: `https://example.test/${secret}`,
+						authorization: secret,
+					},
+					{
+						type: "shell",
+						environment: { type: "local", skills: [{ name: secret, path: secret, description: text }] },
+					},
+				],
+			} satisfies ResponseToolSearchOutputItemParam,
+			{
+				type: "additional_tools",
+				role: "developer",
+				id: secret,
+				tools: [
+					{ type: "tool_search", execution: "client", description: text, parameters: schemaFor(text) },
+					{
+						type: "shell",
+						environment: {
+							type: "container_auto",
+							file_ids: [secret],
+							skills: [
+								{
+									type: "inline",
+									name: secret,
+									description: text,
+									source: { type: "base64", media_type: "application/zip", data: secret },
+								},
+								{ type: "skill_reference", skill_id: secret, version: "latest" },
+							],
+						},
+					},
+					{ type: "shell", environment: { type: "container_reference", container_id: secret } },
+				],
+			} satisfies ResponseInputItem.AdditionalTools,
+		];
+		const original = {
+			providerPayload: { type: "openaiResponsesHistory" as const, provider: "openai", items: itemsFor(secret) },
+			preserveData: { openaiRemoteCompaction: { provider: "openai", replacementHistory: itemsFor(secret) } },
+		};
+		const snapshot = structuredClone(original);
+		const scrubbed = obfuscateNativeReplay(obfuscator, original, new Set());
+		const expected = itemsFor(obfuscator.obfuscate(secret));
+		expect(scrubbed.providerPayload.items).toEqual(expected);
+		expect(scrubbed.preserveData.openaiRemoteCompaction.replacementHistory).toEqual(expected);
+		expect(original).toEqual(snapshot);
+		expect(obfuscateNativeReplay(obfuscator, scrubbed, new Set())).toBe(scrubbed);
+	});
+
+	it("preserves satisfiable discovery constraints while redacting descriptions", () => {
+		const secret = "NATIVE_SECRET_123456";
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "NATIVESECRET123456" },
+			{ type: "regex", content: "NATIVE_SECRET_[0-9]+" },
+		]);
+		const stale = obfuscator.obfuscate("OTHERSECRET");
+		const parameters = {
+			type: "object",
+			description: "Choose OTHERSECRET",
+			required: ["token", "mode"],
+			additionalProperties: false,
+			properties: {
+				token: { type: "string", const: secret, pattern: "^NATIVE_SECRET_[0-9]+$", maxLength: secret.length },
+				mode: { type: "string", enum: [secret, "public"], default: secret },
+			},
+			"x-mcp-header": secret,
+		};
+		const replay = {
+			providerPayload: {
+				type: "openaiResponsesHistory" as const,
+				provider: "openai",
+				items: [
+					{
+						type: "tool_search_output",
+						id: secret,
+						execution: "client",
+						status: "completed",
+						tools: [{ type: "function", name: secret, parameters, strict: false }],
+					} satisfies ResponseToolSearchOutputItemParam,
+				],
+			},
+		};
+		const values = new Set<string>();
+		collectNativeReplayRegexSecretValues(obfuscator, replay, values);
+		expect(values).toEqual(new Set());
+		const scrubbed = obfuscateNativeReplay(obfuscator, replay, values);
+		const schema = scrubbed.providerPayload.items[0]!.tools[0]!.parameters;
+		expect(isJsonSchemaValueValid(schema, { token: secret, mode: secret })).toBe(true);
+		expect(isJsonSchemaValueValid(schema, { token: secret, mode: "public" })).toBe(true);
+		expect(isJsonSchemaValueValid(schema, { token: "invalid", mode: "public" })).toBe(false);
+		expect(isJsonSchemaValueValid(schema, { token: secret, mode: "invalid" })).toBe(false);
+		expect(schema.description).not.toContain("OTHERSECRET");
+		expect(parameters.description).toBe("Choose OTHERSECRET");
+		expect(obfuscator.obfuscate(stale, values)).toContain("NATIVESECRET123456_");
+	});
+
+	it.each([
+		{
+			source: "provider replay",
+			kind: "MCP schema examples",
+			item: {
+				type: "mcp_list_tools",
+				id: "discovery",
+				server_label: "catalog",
+				tools: [
+					{
+						name: "lookup",
+						description: "Available lookup",
+						input_schema: { properties: { query: { examples: ["tok_abc123"] } } },
+					},
+				],
+			} satisfies ResponseInputItem.McpListTools,
+		},
+		{
+			source: "detached next-compaction history",
+			kind: "function schema examples",
+			item: {
+				type: "tool_search_output",
+				id: "discovery",
+				execution: "server",
+				status: "completed",
+				tools: [
+					{
+						type: "function",
+						name: "lookup",
+						strict: false,
+						parameters: { $defs: { query: { examples: [{ value: "tok_abc123" }] } } },
+					},
+				],
+			} satisfies ResponseToolSearchOutputItemParam,
+		},
+		{
+			source: "provider replay",
+			kind: "local shell skill",
+			item: {
+				type: "tool_search_output",
+				execution: "server",
+				status: "completed",
+				tools: [
+					{
+						type: "shell",
+						environment: {
+							type: "local",
+							skills: [{ name: "lookup", path: "/tmp/lookup", description: "tok_abc123" }],
+						},
+					},
+				],
+			} satisfies ResponseToolSearchOutputItemParam,
+		},
+		{
+			source: "detached next-compaction history",
+			kind: "inline shell skill",
+			item: {
+				type: "additional_tools",
+				role: "developer",
+				tools: [
+					{
+						type: "shell",
+						environment: {
+							type: "container_auto",
+							skills: [
+								{
+									type: "inline",
+									name: "lookup",
+									description: "tok_abc123",
+									source: {
+										type: "base64",
+										media_type: "application/zip",
+										data: "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==",
+									},
+								},
+							],
+						},
+					},
+				],
+			} satisfies ResponseInputItem.AdditionalTools,
+		},
+	])("discovers regex values only in $source ($kind) before encoding earlier history", ({ source, item }) => {
+		const model = getBundledModel<"openai-responses">("openai", "gpt-5.4");
+		if (!model || model.api !== "openai-responses") throw new Error("Expected bundled OpenAI Responses model");
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace", replacement: "[hidden]" },
+		]);
+		const stale = obfuscator.obfuscate("remember OTHERSECRET");
+		expect(stale).toContain("TOKABC123_");
+		const opaque = { type: "compaction", encrypted_content: "opaque TOKABC123_" };
+		const providerItems = source === "provider replay" ? [item, opaque] : [opaque];
+		const replay = {
+			role: "developer" as const,
+			attribution: "agent" as const,
+			content: "Native replay",
+			timestamp: 2,
+			providerPayload: { type: "openaiResponsesHistory" as const, provider: model.provider, items: providerItems },
+			preserveData: {
+				openaiRemoteCompaction: {
+					provider: model.provider,
+					compactionItem: opaque,
+					replacementHistory: [
+						{ type: "message", role: "user", content: [{ type: "input_text", text: stale }] },
+						...(source === "provider replay" ? [] : [structuredClone(item)]),
+						opaque,
+					],
+				},
+			},
+		};
+		const messages: Message[] = [{ role: "user", content: stale, timestamp: 1 }, replay];
+		const snapshot = structuredClone(messages);
+		const values = new Set<string>();
+		collectNativeReplayRegexSecretValues(obfuscator, replay, values);
+		expect(values).toEqual(new Set(["tok_abc123"]));
+		const scrubbed = obfuscateMessages(obfuscator, messages);
+		const retained = scrubbed[1] as typeof replay;
+		const input = buildParams(model, { messages: scrubbed }, undefined, undefined).params.input;
+		const responsesInput = buildResponsesInput({
+			model,
+			context: { messages: scrubbed },
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: false,
+			nativeHistory: { replay: true, filterReasoning: false },
+		});
+		if (!Array.isArray(input)) throw new Error("Expected encoded Responses input");
+		const nextCompaction = buildOpenAiNativeHistory(
+			[],
+			model,
+			retained.preserveData.openaiRemoteCompaction.replacementHistory,
+		);
+		for (const history of [input, responsesInput, nextCompaction]) {
+			const plaintext = JSON.stringify(history.filter(entry => entry.type !== "compaction"));
+			expect(plaintext).not.toContain("tok_abc123");
+			expect(plaintext).not.toContain("TOKABC123_");
+			expect(plaintext).not.toContain("OTHERSECRET");
+			expect(obfuscator.deobfuscate(plaintext)).toContain("remember OTHERSECRET");
+			expect(history.find(entry => entry.type === "compaction")).toMatchObject(opaque);
+		}
+		const expectedTools = JSON.parse(JSON.stringify(item.tools).replaceAll("tok_abc123", "[hidden]"));
+		if (source === "provider replay") {
+			expect(input.find(entry => entry.type === item.type)).toMatchObject({ tools: expectedTools });
+			expect(responsesInput.find(entry => entry.type === item.type)).toMatchObject({ tools: expectedTools });
+		} else {
+			expect(nextCompaction.find(entry => entry.type === item.type)).toMatchObject({ tools: expectedTools });
+			expect(retained.providerPayload).toBe(replay.providerPayload);
+		}
+		expect(messages).toEqual(snapshot);
+		expect(obfuscateMessages(obfuscator, scrubbed)).toBe(scrubbed);
+	});
+
+	it("scrubs native plaintext and tool data without rewriting encrypted or structural fields", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+		]);
+		const stale = obfuscator.obfuscate("OTHERSECRET");
+		const image = { type: "input_image", image_url: `data:image/png;base64,${stale}`, detail: "auto" };
+		const file = { type: "input_file", file_id: stale, file_data: stale };
+		const compactionItem = { type: "compaction_summary", summary: stale, encrypted_content: stale };
+		const items: Array<Record<string, unknown>> = [
+			{ type: "message", role: "user", id: stale, content: [{ type: "input_text", text: stale }, image, file] },
+			{
+				type: "message",
+				role: "assistant",
+				phase: "final_answer",
+				content: [
+					{ type: "output_text", text: stale, annotations: [{ type: "file_citation", file_id: stale }] },
+					{ type: "refusal", refusal: stale },
+				],
+			},
+			{
+				type: "reasoning",
+				id: stale,
+				encrypted_content: stale,
+				summary: [{ type: "summary_text", text: stale }],
+				content: [{ type: "reasoning_text", text: stale }],
+			},
+			{
+				type: "function_call",
+				call_id: stale,
+				name: stale,
+				arguments: JSON.stringify({ nested: [stale], [stale]: 1 }),
+				encrypted_function_args: [],
+			},
+			{ type: "function_call", call_id: "structured", name: "search", arguments: { nested: { query: stale } } },
+			{ type: "function_call_output", call_id: stale, output: [{ type: "input_text", text: stale }, image, file] },
+			{ type: "custom_tool_call", call_id: stale, name: "apply_patch", input: stale },
+			{ type: "custom_tool_call_output", call_id: stale, output: stale },
+			{
+				type: "function_call",
+				call_id: "encrypted",
+				name: "collaborate",
+				arguments: stale,
+				encrypted_function_args: [stale],
+			},
+			{
+				type: "shell_call_output",
+				call_id: "shell",
+				output: [{ stdout: stale, stderr: stale, outcome: { type: "exit", exit_code: 1 } }],
+			},
+			{
+				type: "computer_call",
+				call_id: "computer",
+				actions: [
+					{ type: "type", text: stale },
+					{ type: "keypress", keys: ["ENTER"] },
+				],
+			},
+			compactionItem,
+		];
+		const original = {
+			providerPayload: { type: "openaiResponsesHistory" as const, provider: "openai-codex", dt: true, items },
+			preserveData: {
+				openaiRemoteCompaction: { provider: "openai-codex", replacementHistory: items, compactionItem },
+				extension: { text: stale },
+			},
+		};
+		const collisions = new Set(["tok_abc123"]);
+		const redacted = obfuscator.obfuscate(stale, collisions);
+		expect(redacted).not.toContain("TOKABC123_");
+		const scrubbed = obfuscateNativeReplay(obfuscator, original, collisions);
+		expect(scrubbed.providerPayload.items).toEqual([
+			{ ...items[0], content: [{ type: "input_text", text: redacted }, image, file] },
+			{
+				...items[1],
+				content: [
+					{ type: "output_text", text: redacted, annotations: [{ type: "file_citation", file_id: stale }] },
+					{ type: "refusal", refusal: redacted },
+				],
+			},
+			{
+				...items[2],
+				summary: [{ type: "summary_text", text: redacted }],
+				content: [{ type: "reasoning_text", text: redacted }],
+			},
+			{ ...items[3], arguments: JSON.stringify({ nested: [redacted], [stale]: 1 }) },
+			{ ...items[4], arguments: { nested: { query: redacted } } },
+			{ ...items[5], output: [{ type: "input_text", text: redacted }, image, file] },
+			{ ...items[6], input: redacted },
+			{ ...items[7], output: redacted },
+			items[8],
+			{ ...items[9], output: [{ stdout: redacted, stderr: redacted, outcome: { type: "exit", exit_code: 1 } }] },
+			{
+				...items[10],
+				actions: [
+					{ type: "type", text: redacted },
+					{ type: "keypress", keys: ["ENTER"] },
+				],
+			},
+			{ ...compactionItem, summary: redacted },
+		]);
+		expect(scrubbed.preserveData.openaiRemoteCompaction.replacementHistory).toBe(scrubbed.providerPayload.items);
+		expect(scrubbed.preserveData.openaiRemoteCompaction.compactionItem).toEqual({
+			...compactionItem,
+			summary: redacted,
+		});
+		expect(scrubbed.preserveData.extension).toBe(original.preserveData.extension);
+		expect(original.providerPayload.items[6]?.input).toBe(stale);
+		expect(original.preserveData.openaiRemoteCompaction.compactionItem.summary).toBe(stale);
+		expect(obfuscateNativeReplay(obfuscator, scrubbed, collisions)).toBe(scrubbed);
+		expect(obfuscateNativeReplay(new SecretObfuscator([]), original, collisions)).toBe(original);
+		const detached = { ...original, preserveData: structuredClone(original.preserveData) };
+		const detachedScrubbed = obfuscateNativeReplay(obfuscator, detached, collisions);
+		expect(detachedScrubbed.preserveData.openaiRemoteCompaction.replacementHistory).toEqual(
+			scrubbed.providerPayload.items,
+		);
+	});
+
+	const fileSearch = { type: "file_search_call" as const, id: "fs-search", status: "completed" as const, queries: [] };
+	const webSearch = { type: "web_search_call" as const, id: "ws-search", status: "completed" as const };
+	const searchCollisionCases: Array<{
+		name: string;
+		item: ResponseFileSearchToolCall | ResponseFunctionWebSearch;
+	}> = [
+		{ name: "file queries", item: { ...fileSearch, queries: ["tok_abc123"] } },
+		{ name: "file result text", item: { ...fileSearch, results: [{ text: "tok_abc123" }] } },
+		{ name: "file result filename", item: { ...fileSearch, results: [{ filename: "tok_abc123.txt" }] } },
+		{
+			name: "file result attributes",
+			item: { ...fileSearch, results: [{ attributes: { label: "tok_abc123", count: 3, enabled: true } }] },
+		},
+		{ name: "web queries", item: { ...webSearch, action: { type: "search", queries: ["tok_abc123"] } } },
+		{ name: "web legacy query", item: { ...webSearch, action: { type: "search", query: "tok_abc123" } } },
+		{
+			name: "web source URL",
+			item: {
+				...webSearch,
+				action: { type: "search", sources: [{ type: "url", url: "https://example.test/tok_abc123" }] },
+			},
+		},
+		{
+			name: "web opened URL",
+			item: { ...webSearch, action: { type: "open_page", url: "https://example.test/tok_abc123" } },
+		},
+		{
+			name: "web find pattern",
+			item: {
+				...webSearch,
+				action: { type: "find_in_page", url: "https://example.test", pattern: "tok_abc123" },
+			},
+		},
+		{
+			name: "web find URL",
+			item: {
+				...webSearch,
+				action: { type: "find_in_page", url: "https://example.test/tok_abc123", pattern: "public text" },
+			},
+		},
+	];
+	it.each(searchCollisionCases)(
+		"collects a collision appearing only in $name before rewriting earlier history",
+		({ item }) => {
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace", replacement: "[hidden]" },
+			]);
+			const stale = obfuscator.obfuscate("remember OTHERSECRET");
+			expect(stale).toContain("TOKABC123_");
+			const opaque = { type: "compaction", encrypted_content: "tok_abc123 TOKABC123_" };
+			const messages: Message[] = [
+				{ role: "user", content: stale, timestamp: 1 },
+				{
+					role: "developer",
+					attribution: "agent",
+					content: "native replay",
+					timestamp: 2,
+					providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [{ ...item }, opaque] },
+				},
+			];
+			const snapshot = structuredClone(messages);
+			const scrubbed = obfuscateMessages(obfuscator, messages);
+			const prompt = scrubbed[0]!;
+			if (prompt.role !== "user" || typeof prompt.content !== "string") throw new Error("Missing earlier prompt");
+			expect(prompt.content).not.toContain("TOKABC123_");
+			expect(obfuscator.deobfuscate(prompt.content)).toBe("remember OTHERSECRET");
+			const replay = scrubbed[1]!;
+			if (replay.role !== "developer" || replay.providerPayload?.type !== "openaiResponsesHistory")
+				throw new Error("Missing native search replay");
+			expect(JSON.stringify(replay.providerPayload.items[0])).not.toContain("tok_abc123");
+			expect(JSON.stringify(replay.providerPayload.items[0])).toContain("[hidden]");
+			expect(replay.providerPayload.items[1]).toBe(opaque);
+			expect(messages).toEqual(snapshot);
+			expect(obfuscateMessages(obfuscator, scrubbed)).toBe(scrubbed);
+		},
+	);
+
+	it("collects native collisions present only in the detached next-compaction source", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace", replacement: "[hidden]" },
+		]);
+		const stale = obfuscator.obfuscate("remember OTHERSECRET");
+		const opaque = { type: "compaction", encrypted_content: "opaque TOKABC123_" };
+		const replay = {
+			role: "developer" as const,
+			attribution: "agent" as const,
+			content: "native replay",
+			timestamp: 2,
+			providerPayload: { type: "openaiResponsesHistory" as const, provider: "openai", items: [opaque] },
+			preserveData: {
+				openaiRemoteCompaction: {
+					provider: "openai",
+					replacementHistory: [
+						{
+							...webSearch,
+							action: { type: "find_in_page", pattern: "tok_abc123", url: "https://example.test" },
+						},
+						opaque,
+					],
+					compactionItem: opaque,
+				},
+			},
+		};
+		const messages: Message[] = [{ role: "user", content: stale, timestamp: 1 }, replay];
+		const snapshot = structuredClone(messages);
+		const scrubbed = obfuscateMessages(obfuscator, messages);
+		expect(JSON.stringify(scrubbed[0])).not.toContain("TOKABC123_");
+		expect(obfuscator.deobfuscate(JSON.stringify(scrubbed[0]))).toContain("remember OTHERSECRET");
+		const scrubbedReplay = scrubbed[1] as typeof replay;
+		expect(scrubbedReplay.providerPayload).toBe(replay.providerPayload);
+		expect(scrubbedReplay.preserveData.openaiRemoteCompaction.replacementHistory[0]).toMatchObject({
+			action: { type: "find_in_page", pattern: "[hidden]", url: "https://example.test" },
+		});
+		expect(scrubbedReplay.preserveData.openaiRemoteCompaction.compactionItem).toBe(opaque);
+		expect(messages).toEqual(snapshot);
+		expect(obfuscateMessages(obfuscator, scrubbed)).toBe(scrubbed);
+	});
+
+	it("collects collisions from decoded native arguments but never from opaque replay bytes", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+		]);
+		const opaque = { type: "compaction", encrypted_content: "tok_abc123", id: "tok_abc123" };
+		const messages: Message[] = [
+			{ role: "user", content: "OTHERSECRET", timestamp: 1 },
+			{
+				role: "developer",
+				attribution: "agent",
+				content: "native replay",
+				timestamp: 2,
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items: [opaque] },
+			},
+		];
+		const first = obfuscateMessages(obfuscator, messages);
+		expect(JSON.stringify(first[0])).toContain("TOKABC123_");
+		const replay = first[1]!;
+		if (replay.role !== "developer" || replay.providerPayload?.type !== "openaiResponsesHistory")
+			throw new Error("Missing native replay");
+		const argumentItem = {
+			type: "function_call",
+			call_id: "call",
+			name: "read",
+			arguments: '{"token":"tok_abc\\u003123"}',
+		};
+		const next = obfuscateMessages(obfuscator, [
+			first[0]!,
+			{ ...replay, providerPayload: { ...replay.providerPayload, items: [argumentItem, opaque] } },
+		]);
+		expect(JSON.stringify(next[0])).not.toContain("TOKABC123_");
+		const nextReplay = next[1]!;
+		if (nextReplay.role !== "developer" || nextReplay.providerPayload?.type !== "openaiResponsesHistory")
+			throw new Error("Missing native replay");
+		expect(JSON.parse(nextReplay.providerPayload.items[0]?.arguments as string).token).not.toBe("tok_abc123");
+		expect(nextReplay.providerPayload.items[1]).toBe(opaque);
+		expect(obfuscateMessages(obfuscator, next)).toBe(next);
 	});
 });
 
@@ -3673,7 +4418,8 @@ describe("deobfuscateAgentMessages (display restore)", () => {
 			timestamp: 1,
 		};
 
-		const [restored] = deobfuscateAgentMessages(obfuscator, [message], true) as [typeof message];
+		const restored = deobfuscateAgentMessages(obfuscator, [message])[0];
+		if (restored?.role !== "compactionSummary") throw new Error("expected restored compaction summary");
 		const blocks = restored.blocks ?? [];
 		const text = blocks[0];
 		const image = blocks[1];
